@@ -87,6 +87,25 @@ struct TaprootCache {
     output_witnesses: sha256::Hash,
 }
 
+/// Whether the `SCRIPT_SIGHASH_RANGEPROOF` script-verification flag is active.
+///
+/// This consensus context is independent of the `SIGHASH_RANGEPROOF` bit in an
+/// [`EcdsaSighashType`]. Before activation, the bit is still serialized in the
+/// sighash type but output proofs are not added to the signing data.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum SighashRangeproofMode {
+    /// Use pre-activation signing semantics without output-proof commitments.
+    Disabled,
+    /// Use post-activation signing semantics with output-proof commitments.
+    Enabled,
+}
+
+impl SighashRangeproofMode {
+    fn is_enabled(self) -> bool {
+        self == Self::Enabled
+    }
+}
+
 /// Contains outputs of previous transactions.
 /// In the case [`SchnorrSighashType`] variant is `ANYONECANPAY`, [`Prevouts::One`] may be provided
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -490,6 +509,11 @@ impl<R: Deref<Target = Transaction>> SighashCache<R> {
     /// Encode the BIP143 signing data for any flag type into a given object implementing a
     /// `std::io::Write` trait.
     ///
+    /// This method uses post-activation [`SighashRangeproofMode::Enabled`]
+    /// semantics. Use
+    /// [`SighashCache::encode_segwitv0_signing_data_to_with_rangeproof_mode`]
+    /// when reproducing pre-activation hashes.
+    ///
     /// *Warning* This does NOT attempt to support `OP_CODESEPARATOR`. In general
     /// this would require evaluating `script_pubkey` to determine which separators
     /// get evaluated and which don't, which we don't have the information to
@@ -500,15 +524,40 @@ impl<R: Deref<Target = Transaction>> SighashCache<R> {
     ///
     pub fn encode_segwitv0_signing_data_to<Write: io::Write>(
         &mut self,
-        mut writer: Write,
+        writer: Write,
         input_index: usize,
         script_code: &Script,
         value: confidential::Value,
         sighash_type: EcdsaSighashType,
     ) -> Result<(), encode::Error> {
+        self.encode_segwitv0_signing_data_to_with_rangeproof_mode(
+            writer,
+            input_index,
+            script_code,
+            value,
+            sighash_type,
+            SighashRangeproofMode::Enabled,
+        )
+    }
+
+    /// Encode the BIP143 signing data with explicit
+    /// `SCRIPT_SIGHASH_RANGEPROOF` activation semantics.
+    ///
+    /// Use [`SighashRangeproofMode::Disabled`] to reproduce pre-activation
+    /// hashes and [`SighashRangeproofMode::Enabled`] for post-activation hashes.
+    pub fn encode_segwitv0_signing_data_to_with_rangeproof_mode<Write: io::Write>(
+        &mut self,
+        mut writer: Write,
+        input_index: usize,
+        script_code: &Script,
+        value: confidential::Value,
+        sighash_type: EcdsaSighashType,
+        rangeproof_mode: SighashRangeproofMode,
+    ) -> Result<(), encode::Error> {
         let zero_hash = [0u8; 32];
 
-        let (sighash, anyone_can_pay, rangeproof) = sighash_type.split_flags();
+        let (sighash, anyone_can_pay, has_rangeproof_bit) = sighash_type.split_flags();
+        let rangeproof = rangeproof_mode.is_enabled() && has_rangeproof_bit;
 
         self.tx.version.consensus_encode(&mut writer)?;
 
@@ -576,6 +625,10 @@ impl<R: Deref<Target = Transaction>> SighashCache<R> {
     }
 
     /// Compute the segwitv0(BIP143) style sighash for any flag type.
+    ///
+    /// This method uses post-activation [`SighashRangeproofMode::Enabled`]
+    /// semantics. Use [`SighashCache::segwitv0_sighash_with_rangeproof_mode`]
+    /// when reproducing pre-activation hashes.
     /// *Warning* This does NOT attempt to support `OP_CODESEPARATOR`. In general
     /// this would require evaluating `script_pubkey` to determine which separators
     /// get evaluated and which don't, which we don't have the information to
@@ -591,9 +644,35 @@ impl<R: Deref<Target = Transaction>> SighashCache<R> {
         value: confidential::Value,
         sighash_type: EcdsaSighashType
     ) -> Sighash {
+        self.segwitv0_sighash_with_rangeproof_mode(
+            input_index,
+            script_code,
+            value,
+            sighash_type,
+            SighashRangeproofMode::Enabled,
+        )
+    }
+
+    /// Compute a SegWit-v0 sighash with explicit
+    /// `SCRIPT_SIGHASH_RANGEPROOF` activation semantics.
+    pub fn segwitv0_sighash_with_rangeproof_mode(
+        &mut self,
+        input_index: usize,
+        script_code: &Script,
+        value: confidential::Value,
+        sighash_type: EcdsaSighashType,
+        rangeproof_mode: SighashRangeproofMode,
+    ) -> Sighash {
         let mut enc = sha256d::Hash::engine();
-        self.encode_segwitv0_signing_data_to(&mut enc, input_index, script_code, value, sighash_type)
-            .expect("engines don't error");
+        self.encode_segwitv0_signing_data_to_with_rangeproof_mode(
+            &mut enc,
+            input_index,
+            script_code,
+            value,
+            sighash_type,
+            rangeproof_mode,
+        )
+        .expect("engines don't error");
         Sighash(enc.finalize())
     }
 
@@ -601,6 +680,11 @@ impl<R: Deref<Target = Transaction>> SighashCache<R> {
     /// sighash flag can be computed.  To actually produce a scriptSig, this hash needs to be run
     /// through an ECDSA signer, the `SighashType` appended to the resulting sig, and a script
     /// written around this, but this is the general (and hard) part.
+    ///
+    /// This method uses post-activation [`SighashRangeproofMode::Enabled`]
+    /// semantics. Use
+    /// [`SighashCache::encode_legacy_signing_data_to_with_rangeproof_mode`]
+    /// when reproducing pre-activation hashes.
     ///
     /// *Warning* This does NOT attempt to support `OP_CODESEPARATOR`. In general this would require
     /// evaluating `script_pubkey` to determine which separators get evaluated and which don't,
@@ -610,14 +694,37 @@ impl<R: Deref<Target = Transaction>> SighashCache<R> {
     ///
     pub fn encode_legacy_signing_data_to<Write: io::Write>(
         &self,
-        mut writer: Write,
+        writer: Write,
         input_index: usize,
         script_pubkey: &Script,
         sighash_type: EcdsaSighashType,
     ) -> Result<(), encode::Error> {
+        self.encode_legacy_signing_data_to_with_rangeproof_mode(
+            writer,
+            input_index,
+            script_pubkey,
+            sighash_type,
+            SighashRangeproofMode::Enabled,
+        )
+    }
+
+    /// Encode legacy signing data with explicit
+    /// `SCRIPT_SIGHASH_RANGEPROOF` activation semantics.
+    ///
+    /// Use [`SighashRangeproofMode::Disabled`] to reproduce pre-activation
+    /// hashes and [`SighashRangeproofMode::Enabled`] for post-activation hashes.
+    pub fn encode_legacy_signing_data_to_with_rangeproof_mode<Write: io::Write>(
+        &self,
+        mut writer: Write,
+        input_index: usize,
+        script_pubkey: &Script,
+        sighash_type: EcdsaSighashType,
+        rangeproof_mode: SighashRangeproofMode,
+    ) -> Result<(), encode::Error> {
         assert!(input_index < self.tx.input.len());  // Panic on OOB
 
-        let (sighash, anyone_can_pay, rangeproof) = sighash_type.split_flags();
+        let (sighash, anyone_can_pay, has_rangeproof_bit) = sighash_type.split_flags();
+        let rangeproof = rangeproof_mode.is_enabled() && has_rangeproof_bit;
 
         // Special-case sighash_single bug because this is easy enough.
         if sighash == EcdsaSighashType::Single && input_index >= self.tx.output.len() {
@@ -711,6 +818,10 @@ impl<R: Deref<Target = Transaction>> SighashCache<R> {
     /// script written around this, but this is the general (and hard) part.
     /// Does not take a mutable reference because it does not do any caching.
     ///
+    /// This method uses post-activation [`SighashRangeproofMode::Enabled`]
+    /// semantics. Use [`SighashCache::legacy_sighash_with_rangeproof_mode`]
+    /// when reproducing pre-activation hashes.
+    ///
     /// *Warning* This does NOT attempt to support `OP_CODESEPARATOR`. In general
     /// this would require evaluating `script_pubkey` to determine which separators
     /// get evaluated and which don't, which we don't have the information to
@@ -725,9 +836,32 @@ impl<R: Deref<Target = Transaction>> SighashCache<R> {
         script_pubkey: &Script,
         sighash_type: EcdsaSighashType,
     ) -> Sighash {
+        self.legacy_sighash_with_rangeproof_mode(
+            input_index,
+            script_pubkey,
+            sighash_type,
+            SighashRangeproofMode::Enabled,
+        )
+    }
+
+    /// Compute a legacy sighash with explicit
+    /// `SCRIPT_SIGHASH_RANGEPROOF` activation semantics.
+    pub fn legacy_sighash_with_rangeproof_mode(
+        &self,
+        input_index: usize,
+        script_pubkey: &Script,
+        sighash_type: EcdsaSighashType,
+        rangeproof_mode: SighashRangeproofMode,
+    ) -> Sighash {
         let mut engine = sha256d::Hash::engine();
-        self.encode_legacy_signing_data_to(&mut engine, input_index, script_pubkey, sighash_type)
-            .expect("engines don't error");
+        self.encode_legacy_signing_data_to_with_rangeproof_mode(
+            &mut engine,
+            input_index,
+            script_pubkey,
+            sighash_type,
+            rangeproof_mode,
+        )
+        .expect("engines don't error");
         Sighash(engine.finalize())
     }
 
@@ -1011,7 +1145,15 @@ mod tests{
     use crate::encode::deserialize;
     use std::str::FromStr;
 
-    fn test_segwit_sighash(tx: &str, script: &str, input_index: usize, value: &str, hash_type: EcdsaSighashType, expected_result: &str) {
+    fn test_segwit_sighash_with_rangeproof_mode(
+        tx: &str,
+        script: &str,
+        input_index: usize,
+        value: &str,
+        hash_type: EcdsaSighashType,
+        rangeproof_mode: SighashRangeproofMode,
+        expected_result: &str,
+    ) {
         let tx: Transaction = deserialize(&hex::decode_to_vec(tx).unwrap()).unwrap();
         let script = Script::from(hex::decode_to_vec(script).unwrap());
         let raw_expected = hex::decode_to_array(expected_result).unwrap();
@@ -1019,8 +1161,26 @@ mod tests{
 
         let mut cache = SighashCache::new(&tx);
         let value : confidential::Value = deserialize(&hex::decode_to_vec(value).unwrap()).unwrap();
-        let actual_result = cache.segwitv0_sighash(input_index, &script, value, hash_type);
+        let actual_result = cache.segwitv0_sighash_with_rangeproof_mode(
+            input_index,
+            &script,
+            value,
+            hash_type,
+            rangeproof_mode,
+        );
         assert_eq!(actual_result, expected_result);
+    }
+
+    fn test_segwit_sighash(tx: &str, script: &str, input_index: usize, value: &str, hash_type: EcdsaSighashType, expected_result: &str) {
+        test_segwit_sighash_with_rangeproof_mode(
+            tx,
+            script,
+            input_index,
+            value,
+            hash_type,
+            SighashRangeproofMode::Enabled,
+            expected_result,
+        );
     }
 
     #[test]
@@ -1044,14 +1204,37 @@ mod tests{
     }
 
 
-    fn test_legacy_sighash(tx: &str, script: &str, input_index: usize, hash_type: EcdsaSighashType, expected_result: &str) {
+    fn test_legacy_sighash_with_rangeproof_mode(
+        tx: &str,
+        script: &str,
+        input_index: usize,
+        hash_type: EcdsaSighashType,
+        rangeproof_mode: SighashRangeproofMode,
+        expected_result: &str,
+    ) {
         let tx: Transaction = deserialize(&hex::decode_to_vec(tx).unwrap()).unwrap();
         let script = Script::from(hex::decode_to_vec(script).unwrap());
         let raw_expected = hex::decode_to_array(expected_result).unwrap();
         let expected_result = Sighash::from_byte_array(raw_expected);
         let sighash_cache = SighashCache::new(&tx);
-        let actual_result = sighash_cache.legacy_sighash(input_index, &script, hash_type);
+        let actual_result = sighash_cache.legacy_sighash_with_rangeproof_mode(
+            input_index,
+            &script,
+            hash_type,
+            rangeproof_mode,
+        );
         assert_eq!(actual_result, expected_result);
+    }
+
+    fn test_legacy_sighash(tx: &str, script: &str, input_index: usize, hash_type: EcdsaSighashType, expected_result: &str) {
+        test_legacy_sighash_with_rangeproof_mode(
+            tx,
+            script,
+            input_index,
+            hash_type,
+            SighashRangeproofMode::Enabled,
+            expected_result,
+        );
     }
 
     #[test]
@@ -1122,6 +1305,41 @@ mod tests{
     }
 
     #[test]
+    fn test_rangeproof_sighashes_before_activation() {
+        let tx = include_str!("../examples/test_vector/raw_blind/extracted_tx.hex").trim();
+        let script = "76a9142d2186719dc0c245e7b4a30f17834f371ca7377c88ac";
+        let value = "0980610bc88e4ab656c2e5ff6fe6c6a39967a1c0d386682240c5ff039148dc335d";
+        let vectors = [
+            (EcdsaSighashType::AllPlusRangeproof, "637f81c67055f744a16db2172d8beee003c9e0af9cad9f54255eab2c1d2dbaf8", "6aea604e49958abd016b6ec0058cf3e2ab4fe407a9dfec21d6ae81e1419a54ae"),
+            (EcdsaSighashType::NonePlusRangeproof, "8aad97fefbf951fa220353a3b2c072600ab653583cb3eb77a27b4a8ed15963a7", "cf9303742059d3a0a44ba4e21538aa2b39a976e53c62d7994615c7c990df94fa"),
+            (EcdsaSighashType::SinglePlusRangeproof, "47a9a287895b359dd1cc2c348af5976642697e8a4cdae6d95201cb9ca20c47d3", "efd64f12ba6b325017fefd642a83248adac4c2a15af0f52ddd27e6268838a5fd"),
+            (EcdsaSighashType::AllPlusAnyoneCanPayPlusRangeproof, "d6c31419347bad60c908c023755b9e6ec7d8b68b4d414f59613d2ba040562c54", "fa4fa93e85028a6f1684e77971b45ce08cbf450119c909bd4a312b200ca039ef"),
+            (EcdsaSighashType::NonePlusAnyoneCanPayPlusRangeproof, "17cf578244d0d75120feb82825290531bf59c660a22bbfef64261e898ad8ae0c", "30543b573bb956e6e4cfaf2dfddad144cc37f6cdc9667031a3a5a224f566e101"),
+            (EcdsaSighashType::SinglePlusAnyoneCanPayPlusRangeproof, "d35dc5759ba7ec14ec43a6743f5a010363145c603c783299e70e47f7aa7e4871", "c7c375601508159a6832c430a7c554fc42e47268c27382f96065d8c7859b73c5"),
+        ];
+
+        for (hash_type, expected_segwit, expected_legacy) in vectors {
+            test_segwit_sighash_with_rangeproof_mode(
+                tx,
+                script,
+                0,
+                value,
+                hash_type,
+                SighashRangeproofMode::Disabled,
+                expected_segwit,
+            );
+            test_legacy_sighash_with_rangeproof_mode(
+                tx,
+                script,
+                0,
+                hash_type,
+                SighashRangeproofMode::Disabled,
+                expected_legacy,
+            );
+        }
+    }
+
+    #[test]
     fn rangeproof_sighash_commits_to_selected_output_proofs() {
         let tx_hex = include_str!("../examples/test_vector/raw_blind/extracted_tx.hex").trim();
         let tx: Transaction = deserialize(&hex::decode_to_vec(tx_hex).unwrap()).unwrap();
@@ -1151,6 +1369,36 @@ mod tests{
         assert_ne!(protected, mutated_protected);
         assert_ne!(protected_legacy, mutated_protected_legacy);
 
+        let mut surjection_mutation = tx.clone();
+        surjection_mutation.output[0].witness.surjection_proof =
+            confidential::SurjectionProof::EMPTY;
+        let mutated_plain = SighashCache::new(&surjection_mutation)
+            .segwitv0_sighash(0, &script, value, EcdsaSighashType::All);
+        let mutated_protected = SighashCache::new(&surjection_mutation)
+            .segwitv0_sighash(0, &script, value, EcdsaSighashType::AllPlusRangeproof);
+        let mutated_protected_legacy = SighashCache::new(&surjection_mutation)
+            .legacy_sighash(0, &script, EcdsaSighashType::AllPlusRangeproof);
+        assert_eq!(plain, mutated_plain);
+        assert_ne!(protected, mutated_protected);
+        assert_ne!(protected_legacy, mutated_protected_legacy);
+
+        let pre_activation = SighashCache::new(&tx).segwitv0_sighash_with_rangeproof_mode(
+            0,
+            &script,
+            value,
+            EcdsaSighashType::AllPlusRangeproof,
+            SighashRangeproofMode::Disabled,
+        );
+        let mutated_pre_activation =
+            SighashCache::new(&surjection_mutation).segwitv0_sighash_with_rangeproof_mode(
+                0,
+                &script,
+                value,
+                EcdsaSighashType::AllPlusRangeproof,
+                SighashRangeproofMode::Disabled,
+            );
+        assert_eq!(pre_activation, mutated_pre_activation);
+
         let single = SighashCache::new(&tx)
             .segwitv0_sighash(0, &script, value, EcdsaSighashType::SinglePlusRangeproof);
         let mut unselected_mutation = tx.clone();
@@ -1158,6 +1406,83 @@ mod tests{
         let mutated_single = SighashCache::new(&unselected_mutation)
             .segwitv0_sighash(0, &script, value, EcdsaSighashType::SinglePlusRangeproof);
         assert_eq!(single, mutated_single);
+    }
+
+    #[test]
+    fn rangeproof_mode_preserves_wrappers_and_ordinary_sighashes() {
+        let tx_hex = include_str!("../examples/test_vector/raw_blind/extracted_tx.hex").trim();
+        let tx: Transaction = deserialize(&hex::decode_to_vec(tx_hex).unwrap()).unwrap();
+        let script = Script::from(
+            hex::decode_to_vec("76a9142d2186719dc0c245e7b4a30f17834f371ca7377c88ac").unwrap()
+        );
+        let value: confidential::Value = deserialize(
+            &hex::decode_to_vec("0980610bc88e4ab656c2e5ff6fe6c6a39967a1c0d386682240c5ff039148dc335d").unwrap()
+        ).unwrap();
+
+        let default = SighashCache::new(&tx).segwitv0_sighash(
+            0,
+            &script,
+            value,
+            EcdsaSighashType::AllPlusRangeproof,
+        );
+        let enabled = SighashCache::new(&tx).segwitv0_sighash_with_rangeproof_mode(
+            0,
+            &script,
+            value,
+            EcdsaSighashType::AllPlusRangeproof,
+            SighashRangeproofMode::Enabled,
+        );
+        assert_eq!(default, enabled);
+        assert_eq!(
+            SighashCache::new(&tx)
+                .legacy_sighash(0, &script, EcdsaSighashType::AllPlusRangeproof),
+            SighashCache::new(&tx).legacy_sighash_with_rangeproof_mode(
+                0,
+                &script,
+                EcdsaSighashType::AllPlusRangeproof,
+                SighashRangeproofMode::Enabled,
+            ),
+        );
+
+        let ordinary_types = [
+            EcdsaSighashType::All,
+            EcdsaSighashType::None,
+            EcdsaSighashType::Single,
+            EcdsaSighashType::AllPlusAnyoneCanPay,
+            EcdsaSighashType::NonePlusAnyoneCanPay,
+            EcdsaSighashType::SinglePlusAnyoneCanPay,
+        ];
+        for hash_type in ordinary_types {
+            let enabled = SighashCache::new(&tx).segwitv0_sighash_with_rangeproof_mode(
+                0,
+                &script,
+                value,
+                hash_type,
+                SighashRangeproofMode::Enabled,
+            );
+            let disabled = SighashCache::new(&tx).segwitv0_sighash_with_rangeproof_mode(
+                0,
+                &script,
+                value,
+                hash_type,
+                SighashRangeproofMode::Disabled,
+            );
+            assert_eq!(enabled, disabled);
+
+            let enabled = SighashCache::new(&tx).legacy_sighash_with_rangeproof_mode(
+                0,
+                &script,
+                hash_type,
+                SighashRangeproofMode::Enabled,
+            );
+            let disabled = SighashCache::new(&tx).legacy_sighash_with_rangeproof_mode(
+                0,
+                &script,
+                hash_type,
+                SighashRangeproofMode::Disabled,
+            );
+            assert_eq!(enabled, disabled);
+        }
     }
 
     #[test]
