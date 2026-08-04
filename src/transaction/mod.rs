@@ -1184,6 +1184,11 @@ impl EcdsaSighashType {
 
     /// Creates an [`EcdsaSighashType`] from a raw `u32`.
     ///
+    /// Recognition is context-free and does not determine whether
+    /// `SCRIPT_SIGHASH_RANGEPROOF` is active for a block. Use
+    /// [`crate::sighash::SighashRangeproofMode`] when computing historical
+    /// signature hashes.
+    ///
     /// # Errors
     ///
     /// If `n` is a non-standard sighash value.

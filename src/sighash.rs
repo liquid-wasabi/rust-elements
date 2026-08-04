@@ -106,6 +106,46 @@ impl SighashRangeproofMode {
     }
 }
 
+/// Result of encoding legacy signing data.
+///
+/// This type forces callers to handle the legacy `SIGHASH_SINGLE` sentinel,
+/// which is already a hash value and cannot be represented as signing data to
+/// be hashed again.
+#[must_use]
+pub enum EncodeSigningDataResult<E> {
+    /// The input triggers the legacy `SIGHASH_SINGLE` bug and must use the
+    /// uint256 value one directly as its sighash.
+    SighashSingleBug,
+    /// Signing data was encoded normally, or the writer returned an error.
+    WriteResult(Result<(), E>),
+}
+
+impl<E> EncodeSigningDataResult<E> {
+    /// Return whether the input triggers the legacy `SIGHASH_SINGLE` bug,
+    /// propagating any writer error.
+    pub fn is_sighash_single_bug(self) -> Result<bool, E> {
+        match self {
+            Self::SighashSingleBug => Ok(true),
+            Self::WriteResult(Ok(())) => Ok(false),
+            Self::WriteResult(Err(error)) => Err(error),
+        }
+    }
+
+    /// Map a writer error while preserving the `SIGHASH_SINGLE` sentinel.
+    pub fn map_err<F, O>(self, op: O) -> EncodeSigningDataResult<F>
+    where
+        O: FnOnce(E) -> F,
+    {
+        match self {
+            Self::SighashSingleBug => EncodeSigningDataResult::SighashSingleBug,
+            Self::WriteResult(Ok(())) => EncodeSigningDataResult::WriteResult(Ok(())),
+            Self::WriteResult(Err(error)) => {
+                EncodeSigningDataResult::WriteResult(Err(op(error)))
+            }
+        }
+    }
+}
+
 /// Contains outputs of previous transactions.
 /// In the case [`SchnorrSighashType`] variant is `ANYONECANPAY`, [`Prevouts::One`] may be provided
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -682,9 +722,11 @@ impl<R: Deref<Target = Transaction>> SighashCache<R> {
     /// written around this, but this is the general (and hard) part.
     ///
     /// This method uses post-activation [`SighashRangeproofMode::Enabled`]
-    /// semantics. Use
-    /// [`SighashCache::encode_legacy_signing_data_to_with_rangeproof_mode`]
-    /// when reproducing pre-activation hashes.
+    /// semantics. It is retained for compatibility, but cannot represent the
+    /// legacy `SIGHASH_SINGLE` sentinel and returns an invalid-input error for
+    /// that case without writing bytes. New code should use
+    /// [`SighashCache::legacy_encode_signing_data_to`] or
+    /// [`SighashCache::legacy_encode_signing_data_to_with_rangeproof_mode`].
     ///
     /// *Warning* This does NOT attempt to support `OP_CODESEPARATOR`. In general this would require
     /// evaluating `script_pubkey` to determine which separators get evaluated and which don't,
@@ -699,7 +741,38 @@ impl<R: Deref<Target = Transaction>> SighashCache<R> {
         script_pubkey: &Script,
         sighash_type: EcdsaSighashType,
     ) -> Result<(), encode::Error> {
-        self.encode_legacy_signing_data_to_with_rangeproof_mode(
+        match self
+            .legacy_encode_signing_data_to(
+                writer,
+                input_index,
+                script_pubkey,
+                sighash_type,
+            )
+            .is_sighash_single_bug()
+        {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "legacy SIGHASH_SINGLE sentinel cannot be encoded as signing data",
+            )
+            .into()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Encode legacy signing data using post-activation
+    /// [`SighashRangeproofMode::Enabled`] semantics.
+    ///
+    /// The return value forces callers to handle the legacy `SIGHASH_SINGLE`
+    /// sentinel without accidentally hashing it again.
+    pub fn legacy_encode_signing_data_to<Write: io::Write>(
+        &self,
+        writer: Write,
+        input_index: usize,
+        script_pubkey: &Script,
+        sighash_type: EcdsaSighashType,
+    ) -> EncodeSigningDataResult<encode::Error> {
+        self.legacy_encode_signing_data_to_with_rangeproof_mode(
             writer,
             input_index,
             script_pubkey,
@@ -713,7 +786,33 @@ impl<R: Deref<Target = Transaction>> SighashCache<R> {
     ///
     /// Use [`SighashRangeproofMode::Disabled`] to reproduce pre-activation
     /// hashes and [`SighashRangeproofMode::Enabled`] for post-activation hashes.
-    pub fn encode_legacy_signing_data_to_with_rangeproof_mode<Write: io::Write>(
+    pub fn legacy_encode_signing_data_to_with_rangeproof_mode<Write: io::Write>(
+        &self,
+        writer: Write,
+        input_index: usize,
+        script_pubkey: &Script,
+        sighash_type: EcdsaSighashType,
+        rangeproof_mode: SighashRangeproofMode,
+    ) -> EncodeSigningDataResult<encode::Error> {
+        assert!(input_index < self.tx.input.len());  // Panic on OOB
+
+        let (sighash, _, _) = sighash_type.split_flags();
+
+        // The sentinel is already the final sighash and must not be hashed again.
+        if sighash == EcdsaSighashType::Single && input_index >= self.tx.output.len() {
+            return EncodeSigningDataResult::SighashSingleBug;
+        }
+
+        EncodeSigningDataResult::WriteResult(self.encode_legacy_signing_data_to_inner(
+            writer,
+            input_index,
+            script_pubkey,
+            sighash_type,
+            rangeproof_mode,
+        ))
+    }
+
+    fn encode_legacy_signing_data_to_inner<Write: io::Write>(
         &self,
         mut writer: Write,
         input_index: usize,
@@ -721,19 +820,8 @@ impl<R: Deref<Target = Transaction>> SighashCache<R> {
         sighash_type: EcdsaSighashType,
         rangeproof_mode: SighashRangeproofMode,
     ) -> Result<(), encode::Error> {
-        assert!(input_index < self.tx.input.len());  // Panic on OOB
-
         let (sighash, anyone_can_pay, has_rangeproof_bit) = sighash_type.split_flags();
         let rangeproof = rangeproof_mode.is_enabled() && has_rangeproof_bit;
-
-        // Special-case sighash_single bug because this is easy enough.
-        if sighash == EcdsaSighashType::Single && input_index >= self.tx.output.len() {
-            writer.write_all(&[1, 0, 0, 0, 0, 0, 0, 0,
-                               0, 0, 0, 0, 0, 0, 0, 0,
-                               0, 0, 0, 0, 0, 0, 0, 0,
-                               0, 0, 0, 0, 0, 0, 0, 0])?;
-            return Ok(());
-        }
 
         // Build tx to sign
         let mut tx = Transaction {
@@ -854,15 +942,24 @@ impl<R: Deref<Target = Transaction>> SighashCache<R> {
         rangeproof_mode: SighashRangeproofMode,
     ) -> Sighash {
         let mut engine = sha256d::Hash::engine();
-        self.encode_legacy_signing_data_to_with_rangeproof_mode(
+        let single_bug = self
+            .legacy_encode_signing_data_to_with_rangeproof_mode(
             &mut engine,
             input_index,
             script_pubkey,
             sighash_type,
             rangeproof_mode,
         )
-        .expect("engines don't error");
-        Sighash(engine.finalize())
+            .is_sighash_single_bug()
+            .expect("engines don't error");
+        if single_bug {
+            Sighash::from_byte_array([
+                1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ])
+        } else {
+            Sighash(engine.finalize())
+        }
     }
 
     #[inline]
@@ -1280,6 +1377,85 @@ mod tests{
     }
 
     #[test]
+    fn legacy_sighash_single_returns_uint256_one() {
+        let tx = Transaction {
+            version: 2,
+            lock_time: crate::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: crate::OutPoint::new(crate::Txid::from_byte_array([0; 32]), 7),
+                is_pegin: false,
+                script_sig: Script::new(),
+                sequence: Sequence::MAX,
+                asset_issuance: crate::AssetIssuance::default(),
+                witness: TxInWitness::default(),
+            }],
+            output: vec![],
+        };
+        let expected = Sighash::from_byte_array([
+            1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]);
+        let hash_types = [
+            EcdsaSighashType::Single,
+            EcdsaSighashType::SinglePlusRangeproof,
+            EcdsaSighashType::SinglePlusAnyoneCanPay,
+            EcdsaSighashType::SinglePlusAnyoneCanPayPlusRangeproof,
+        ];
+        let modes = [
+            SighashRangeproofMode::Disabled,
+            SighashRangeproofMode::Enabled,
+        ];
+
+        for hash_type in hash_types {
+            assert_eq!(
+                SighashCache::new(&tx).legacy_sighash(0, &Script::new(), hash_type),
+                expected,
+            );
+
+            for mode in modes {
+                assert_eq!(
+                    SighashCache::new(&tx).legacy_sighash_with_rangeproof_mode(
+                        0,
+                        &Script::new(),
+                        hash_type,
+                        mode,
+                    ),
+                    expected,
+                );
+
+                let mut preimage = Vec::new();
+                let is_single_bug = SighashCache::new(&tx)
+                    .legacy_encode_signing_data_to_with_rangeproof_mode(
+                        &mut preimage,
+                        0,
+                        &Script::new(),
+                        hash_type,
+                        mode,
+                    )
+                    .is_sighash_single_bug()
+                    .unwrap();
+                assert!(is_single_bug);
+                assert!(preimage.is_empty());
+            }
+
+            let mut compatibility_preimage = Vec::new();
+            let error = SighashCache::new(&tx)
+                .encode_legacy_signing_data_to(
+                    &mut compatibility_preimage,
+                    0,
+                    &Script::new(),
+                    hash_type,
+                )
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                encode::Error::Io(ref error) if error.kind() == io::ErrorKind::InvalidInput
+            ));
+            assert!(compatibility_preimage.is_empty());
+        }
+    }
+
+    #[test]
     fn test_rangeproof_sighashes() {
         let tx = include_str!("../examples/test_vector/raw_blind/extracted_tx.hex").trim();
         let script = "76a9142d2186719dc0c245e7b4a30f17834f371ca7377c88ac";
@@ -1334,6 +1510,64 @@ mod tests{
                 0,
                 hash_type,
                 SighashRangeproofMode::Disabled,
+                expected_legacy,
+            );
+        }
+    }
+
+    #[test]
+    fn rangeproof_sighash_with_issuance_and_pegin_matches_core() {
+        let tx_hex = include_str!("../examples/test_vector/raw_blind/extracted_tx.hex").trim();
+        let mut tx: Transaction = deserialize(&hex::decode_to_vec(tx_hex).unwrap()).unwrap();
+        tx.input.truncate(1);
+        tx.input[0].is_pegin = true;
+        tx.input[0].asset_issuance = crate::AssetIssuance {
+            asset_blinding_nonce: crate::AssetBlindingNonce::NEW_ISSUANCE,
+            asset_entropy: crate::AssetEntropy::NEW_ISSUANCE,
+            amount: confidential::Value::Explicit(1),
+            inflation_keys: confidential::Value::Null,
+        };
+        let script = Script::from(
+            hex::decode_to_vec("76a9142d2186719dc0c245e7b4a30f17834f371ca7377c88ac").unwrap()
+        );
+        let value: confidential::Value = deserialize(
+            &hex::decode_to_vec("0980610bc88e4ab656c2e5ff6fe6c6a39967a1c0d386682240c5ff039148dc335d").unwrap()
+        ).unwrap();
+        let vectors = [
+            (
+                SighashRangeproofMode::Disabled,
+                "2f7d731194e7932b8d12265cec15d94713138f30ea88ab98754df3d6d0558543",
+                "29a16d4f9e7684f461da9050df14a5a46a4894c88c6afd735481560f5bfe3016",
+            ),
+            (
+                SighashRangeproofMode::Enabled,
+                "45ad6fac7312d3791194dab0aac049ae3b84cb44b8c2eedaf2effaf0570375cd",
+                "2d26bb50748cc968da5a9e7187e0036e3acdf08344b978c9b05667ebfc087de3",
+            ),
+        ];
+
+        for (mode, expected_segwit, expected_legacy) in vectors {
+            let expected_segwit =
+                Sighash::from_byte_array(hex::decode_to_array(expected_segwit).unwrap());
+            let expected_legacy =
+                Sighash::from_byte_array(hex::decode_to_array(expected_legacy).unwrap());
+            assert_eq!(
+                SighashCache::new(&tx).segwitv0_sighash_with_rangeproof_mode(
+                    0,
+                    &script,
+                    value,
+                    EcdsaSighashType::AllPlusRangeproof,
+                    mode,
+                ),
+                expected_segwit,
+            );
+            assert_eq!(
+                SighashCache::new(&tx).legacy_sighash_with_rangeproof_mode(
+                    0,
+                    &script,
+                    EcdsaSighashType::AllPlusRangeproof,
+                    mode,
+                ),
                 expected_legacy,
             );
         }
