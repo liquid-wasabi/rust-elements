@@ -20,7 +20,7 @@
 //!
 
 use std::borrow::Borrow;
-use crate::encode::{self, Encodable};
+use crate::encode::{self, Encodable, VarInt};
 use crate::hash_types::Sighash;
 use crate::hashes::{sha256d, sha256t, sha256, HashEngine as _};
 use crate::script::Script;
@@ -74,6 +74,7 @@ struct SegwitCache {
     sequences: sha256d::Hash,
     issuances: sha256d::Hash,
     outputs: sha256d::Hash,
+    rangeproofs: sha256d::Hash,
 }
 
 /// Values cached for taproot inputs
@@ -507,7 +508,7 @@ impl<R: Deref<Target = Transaction>> SighashCache<R> {
     ) -> Result<(), encode::Error> {
         let zero_hash = [0u8; 32];
 
-        let (sighash, anyone_can_pay) = sighash_type.split_anyonecanpay_flag();
+        let (sighash, anyone_can_pay, rangeproof) = sighash_type.split_flags();
 
         self.tx.version.consensus_encode(&mut writer)?;
 
@@ -553,6 +554,20 @@ impl<R: Deref<Target = Transaction>> SighashCache<R> {
             Sighash(single_enc.finalize()).consensus_encode(&mut writer)?;
         } else {
             zero_hash.consensus_encode(&mut writer)?;
+        }
+
+        if rangeproof {
+            if sighash != EcdsaSighashType::Single && sighash != EcdsaSighashType::None {
+                self.segwit_cache().rangeproofs.consensus_encode(&mut writer)?;
+            } else if sighash == EcdsaSighashType::Single && input_index < self.tx.output.len() {
+                let mut single_enc = sha256d::Hash::engine();
+                let witness = &self.tx.output[input_index].witness;
+                witness.rangeproof.consensus_encode(&mut single_enc)?;
+                witness.surjection_proof.consensus_encode(&mut single_enc)?;
+                Sighash(single_enc.finalize()).consensus_encode(&mut writer)?;
+            } else {
+                zero_hash.consensus_encode(&mut writer)?;
+            }
         }
 
         self.tx.lock_time.consensus_encode(&mut writer)?;
@@ -602,7 +617,7 @@ impl<R: Deref<Target = Transaction>> SighashCache<R> {
     ) -> Result<(), encode::Error> {
         assert!(input_index < self.tx.input.len());  // Panic on OOB
 
-        let (sighash, anyone_can_pay) = sighash_type.split_anyonecanpay_flag();
+        let (sighash, anyone_can_pay, rangeproof) = sighash_type.split_flags();
 
         // Special-case sighash_single bug because this is easy enough.
         if sighash == EcdsaSighashType::Single && input_index >= self.tx.output.len() {
@@ -661,7 +676,18 @@ impl<R: Deref<Target = Transaction>> SighashCache<R> {
         // of elements tx(they include witness flag even for non-witness transactions)
         tx.version.consensus_encode(&mut writer)?;
         tx.input.consensus_encode(&mut writer)?;
-        tx.output.consensus_encode(&mut writer)?;
+        if rangeproof {
+            VarInt(tx.output.len() as u64).consensus_encode(&mut writer)?;
+            for (index, output) in tx.output.iter().enumerate() {
+                output.consensus_encode(&mut writer)?;
+                if sighash != EcdsaSighashType::Single || index == input_index {
+                    output.witness.rangeproof.consensus_encode(&mut writer)?;
+                    output.witness.surjection_proof.consensus_encode(&mut writer)?;
+                }
+            }
+        } else {
+            tx.output.consensus_encode(&mut writer)?;
+        }
         tx.lock_time.consensus_encode(&mut writer)?;
 
         let sighash_arr = endian::u32_to_array_le(sighash_type.as_u32());
@@ -756,6 +782,14 @@ impl<R: Deref<Target = Transaction>> SighashCache<R> {
                 issuances: sha256d::Hash::from_byte_array(
                     sha256::Hash::hash(common_cache.issuances.as_ref()).to_byte_array(),
                 ),
+                rangeproofs: {
+                    let mut enc = sha256d::Hash::engine();
+                    for output in &tx.output {
+                        output.witness.rangeproof.consensus_encode(&mut enc).unwrap();
+                        output.witness.surjection_proof.consensus_encode(&mut enc).unwrap();
+                    }
+                    sha256d::Hash::from_engine(enc)
+                },
             }
         })
     }
@@ -965,6 +999,7 @@ impl std::str::FromStr for SchnorrSighashType {
 mod tests{
     use super::*;
     use crate::encode::deserialize;
+    use std::str::FromStr;
 
     fn test_segwit_sighash(tx: &str, script: &str, input_index: usize, value: &str, hash_type: EcdsaSighashType, expected_result: &str) {
         let tx: Transaction = deserialize(&hex::decode_to_vec(tx).unwrap()).unwrap();
@@ -1021,5 +1056,96 @@ mod tests{
 
         // Test a issuance test with only sighash all
         test_legacy_sighash("010000000001715df5ccebaf02ff18d6fae7263fa69fed5de59c900f4749556eba41bc7bf2af000000800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000003e801000000000000000a0201230f4f5d4b7c6fa845806ee4f67713459e1b69e8e60fcee2e4940c7a0d5de1b2010000000124101100001f5175517551755175517551755175517551755175517551755175517551755101230f4f5d4b7c6fa845806ee4f67713459e1b69e8e60fcee2e4940c7a0d5de1b2010000000005f5e100000000000000", "76a914f54a5851e9372b87810a8e60cdd2e7cfd80b6e3188ac", 0, EcdsaSighashType::All, "9f00e1758a230aaf6c9bce777701a604f50b2ac5f2a07e1cd478d8a0e70fc195");
+    }
+
+    #[test]
+    fn test_rangeproof_sighashes() {
+        let tx = include_str!("../examples/test_vector/raw_blind/extracted_tx.hex").trim();
+        let script = "76a9142d2186719dc0c245e7b4a30f17834f371ca7377c88ac";
+        let value = "0980610bc88e4ab656c2e5ff6fe6c6a39967a1c0d386682240c5ff039148dc335d";
+        let vectors = [
+            (EcdsaSighashType::AllPlusRangeproof, "4d0a5d82ff74812f5235b42bfdf809864dd2695f13d1c5921a4606138da302eb", "c4a6b4bedfdc35eba3e5e1ccf270d20ccb4d3ac382b964a5d6be0367a7b6bcdf"),
+            (EcdsaSighashType::NonePlusRangeproof, "87ab326e501e1431a99e3496aecf2d53876cc23f67f3ee533c013d64472d74f5", "cf9303742059d3a0a44ba4e21538aa2b39a976e53c62d7994615c7c990df94fa"),
+            (EcdsaSighashType::SinglePlusRangeproof, "76b0078ad98f45574b87228c2f1b6986050c93fec4ba6c08fb762ed1277e4273", "578db085c8ae8ba0fe18623818fe7956ed68506b429fa9d528fdd8ffa93ac768"),
+            (EcdsaSighashType::AllPlusAnyoneCanPayPlusRangeproof, "c1b39c7de724231badc251fa28635a716706b35577fd7765459bf7c56c1e3c56", "701b8a02ee58ce8e6a420cc5639f26087549f8232d8d5050eca603aa9a0163a4"),
+            (EcdsaSighashType::NonePlusAnyoneCanPayPlusRangeproof, "182e33c3aee200d59ba71de16e034d3cc37b9e0f0317239235bd3d54baea97ec", "30543b573bb956e6e4cfaf2dfddad144cc37f6cdc9667031a3a5a224f566e101"),
+            (EcdsaSighashType::SinglePlusAnyoneCanPayPlusRangeproof, "d40fee5bb66e2ad1e575e40d73bd542f9047eb76558a49738c5a34442df2e9b5", "d9ca5ff22b0d58b53e34d5bddcc6eec1fa161076332a2437311d8cb1592f45ec"),
+        ];
+
+        for (hash_type, expected_segwit, expected_legacy) in vectors {
+            test_segwit_sighash(tx, script, 0, value, hash_type, expected_segwit);
+            test_legacy_sighash(tx, script, 0, hash_type, expected_legacy);
+        }
+
+        // Elements Core omits proof fields after SINGLE placeholder outputs.
+        let script_1 = "76a91403bb7619d51d2af2c5538d3908ead081a7ef2b2b88ac";
+        test_legacy_sighash(tx, script_1, 1, EcdsaSighashType::SinglePlusRangeproof, "a5b3d854d7c2e1193aa2bad8f829a9c1c5b4bc71488e3b567b5724cc87ec065f");
+        test_legacy_sighash(tx, script_1, 1, EcdsaSighashType::SinglePlusAnyoneCanPayPlusRangeproof, "718fdd392e3353cd36eed0124d325ed136e8946c62f11f529cde048697f1c33f");
+    }
+
+    #[test]
+    fn rangeproof_sighash_commits_to_selected_output_proofs() {
+        let tx_hex = include_str!("../examples/test_vector/raw_blind/extracted_tx.hex").trim();
+        let tx: Transaction = deserialize(&hex::decode_to_vec(tx_hex).unwrap()).unwrap();
+        let script = Script::from(
+            hex::decode_to_vec("76a9142d2186719dc0c245e7b4a30f17834f371ca7377c88ac").unwrap()
+        );
+        let value: confidential::Value = deserialize(
+            &hex::decode_to_vec("0980610bc88e4ab656c2e5ff6fe6c6a39967a1c0d386682240c5ff039148dc335d").unwrap()
+        ).unwrap();
+
+        let plain = SighashCache::new(&tx)
+            .segwitv0_sighash(0, &script, value, EcdsaSighashType::All);
+        let protected = SighashCache::new(&tx)
+            .segwitv0_sighash(0, &script, value, EcdsaSighashType::AllPlusRangeproof);
+        let protected_legacy = SighashCache::new(&tx)
+            .legacy_sighash(0, &script, EcdsaSighashType::AllPlusRangeproof);
+
+        let mut selected_mutation = tx.clone();
+        selected_mutation.output[0].witness.rangeproof = confidential::RangeProof::EMPTY;
+        let mutated_plain = SighashCache::new(&selected_mutation)
+            .segwitv0_sighash(0, &script, value, EcdsaSighashType::All);
+        let mutated_protected = SighashCache::new(&selected_mutation)
+            .segwitv0_sighash(0, &script, value, EcdsaSighashType::AllPlusRangeproof);
+        let mutated_protected_legacy = SighashCache::new(&selected_mutation)
+            .legacy_sighash(0, &script, EcdsaSighashType::AllPlusRangeproof);
+        assert_eq!(plain, mutated_plain);
+        assert_ne!(protected, mutated_protected);
+        assert_ne!(protected_legacy, mutated_protected_legacy);
+
+        let single = SighashCache::new(&tx)
+            .segwitv0_sighash(0, &script, value, EcdsaSighashType::SinglePlusRangeproof);
+        let mut unselected_mutation = tx.clone();
+        unselected_mutation.output[1].witness.rangeproof = confidential::RangeProof::EMPTY;
+        let mutated_single = SighashCache::new(&unselected_mutation)
+            .segwitv0_sighash(0, &script, value, EcdsaSighashType::SinglePlusRangeproof);
+        assert_eq!(single, mutated_single);
+    }
+
+    #[test]
+    fn rangeproof_sighash_types_roundtrip_through_pset() {
+        use crate::pset::PsbtSighashType;
+
+        let vectors = [
+            (0x41, EcdsaSighashType::AllPlusRangeproof, "SIGHASH_ALL|SIGHASH_RANGEPROOF"),
+            (0x42, EcdsaSighashType::NonePlusRangeproof, "SIGHASH_NONE|SIGHASH_RANGEPROOF"),
+            (0x43, EcdsaSighashType::SinglePlusRangeproof, "SIGHASH_SINGLE|SIGHASH_RANGEPROOF"),
+            (0xc1, EcdsaSighashType::AllPlusAnyoneCanPayPlusRangeproof, "SIGHASH_ALL|SIGHASH_ANYONECANPAY|SIGHASH_RANGEPROOF"),
+            (0xc2, EcdsaSighashType::NonePlusAnyoneCanPayPlusRangeproof, "SIGHASH_NONE|SIGHASH_ANYONECANPAY|SIGHASH_RANGEPROOF"),
+            (0xc3, EcdsaSighashType::SinglePlusAnyoneCanPayPlusRangeproof, "SIGHASH_SINGLE|SIGHASH_ANYONECANPAY|SIGHASH_RANGEPROOF"),
+        ];
+
+        for (raw, hash_type, text) in vectors {
+            assert_eq!(EcdsaSighashType::from_u32(raw), hash_type);
+            assert_eq!(EcdsaSighashType::from_standard(raw), Ok(hash_type));
+            assert_eq!(hash_type.to_string(), text);
+            assert_eq!(EcdsaSighashType::from_str(text), Ok(hash_type));
+
+            let pset_type = PsbtSighashType::from(hash_type);
+            assert_eq!(pset_type.to_u32(), raw);
+            assert_eq!(pset_type.ecdsa_hash_ty(), Some(hash_type));
+            assert_eq!(pset_type.to_string(), text);
+            assert_eq!(PsbtSighashType::from_str(text).unwrap(), pset_type);
+        }
     }
 }

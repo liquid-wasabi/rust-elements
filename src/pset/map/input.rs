@@ -362,6 +362,9 @@ serde_string_impl!(PsbtSighashType, "a PsbtSighashType data");
 
 impl fmt::Display for PsbtSighashType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(ecdsa_hash_ty) = self.ecdsa_hash_ty() {
+            return fmt::Display::fmt(&ecdsa_hash_ty, f);
+        }
         match self.schnorr_hash_ty() {
             Some(SchnorrSighashType::Reserved) | None => write!(f, "{:#x}", self.inner),
             Some(schnorr_hash_ty) => fmt::Display::fmt(&schnorr_hash_ty, f),
@@ -387,6 +390,10 @@ impl FromStr for PsbtSighashType {
             }
             Ok(ty) => return Ok(ty.into()),
             Err(_) => {}
+        }
+
+        if let Ok(ty) = EcdsaSighashType::from_str(s) {
+            return Ok(ty.into());
         }
 
         // We accept non-standard sighash values.

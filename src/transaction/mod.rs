@@ -1070,12 +1070,24 @@ pub enum EcdsaSighashType {
     /// (This rule is probably an unintentional C++ism, but it's consensus so we have
     /// to follow it.)
     Single = 0x03,
+    /// 0x41: Sign all outputs and their range and surjection proofs
+    AllPlusRangeproof = 0x41,
+    /// 0x42: Sign no outputs, with the rangeproof flag set
+    NonePlusRangeproof = 0x42,
+    /// 0x43: Sign one output and its range and surjection proofs
+    SinglePlusRangeproof = 0x43,
     /// 0x81: Sign all outputs but only this input
     AllPlusAnyoneCanPay = 0x81,
     /// 0x82: Sign no outputs and only this input
     NonePlusAnyoneCanPay = 0x82,
     /// 0x83: Sign one output and only this input (see `Single` for what "one output" means)
     SinglePlusAnyoneCanPay = 0x83,
+    /// 0xc1: Sign all outputs and their range and surjection proofs, but only this input
+    AllPlusAnyoneCanPayPlusRangeproof = 0xc1,
+    /// 0xc2: Sign no outputs, with the rangeproof flag set, and only this input
+    NonePlusAnyoneCanPayPlusRangeproof = 0xc2,
+    /// 0xc3: Sign one output and its range and surjection proofs, but only this input
+    SinglePlusAnyoneCanPayPlusRangeproof = 0xc3,
 }
 
 serde_string_impl!(EcdsaSighashType, "a EcdsaSighashType data");
@@ -1086,9 +1098,15 @@ impl fmt::Display for EcdsaSighashType {
             EcdsaSighashType::All => "SIGHASH_ALL",
             EcdsaSighashType::None => "SIGHASH_NONE",
             EcdsaSighashType::Single => "SIGHASH_SINGLE",
+            EcdsaSighashType::AllPlusRangeproof => "SIGHASH_ALL|SIGHASH_RANGEPROOF",
+            EcdsaSighashType::NonePlusRangeproof => "SIGHASH_NONE|SIGHASH_RANGEPROOF",
+            EcdsaSighashType::SinglePlusRangeproof => "SIGHASH_SINGLE|SIGHASH_RANGEPROOF",
             EcdsaSighashType::AllPlusAnyoneCanPay => "SIGHASH_ALL|SIGHASH_ANYONECANPAY",
             EcdsaSighashType::NonePlusAnyoneCanPay => "SIGHASH_NONE|SIGHASH_ANYONECANPAY",
             EcdsaSighashType::SinglePlusAnyoneCanPay => "SIGHASH_SINGLE|SIGHASH_ANYONECANPAY",
+            EcdsaSighashType::AllPlusAnyoneCanPayPlusRangeproof => "SIGHASH_ALL|SIGHASH_ANYONECANPAY|SIGHASH_RANGEPROOF",
+            EcdsaSighashType::NonePlusAnyoneCanPayPlusRangeproof => "SIGHASH_NONE|SIGHASH_ANYONECANPAY|SIGHASH_RANGEPROOF",
+            EcdsaSighashType::SinglePlusAnyoneCanPayPlusRangeproof => "SIGHASH_SINGLE|SIGHASH_ANYONECANPAY|SIGHASH_RANGEPROOF",
         };
         f.write_str(s)
     }
@@ -1102,39 +1120,59 @@ impl str::FromStr for EcdsaSighashType {
             "SIGHASH_ALL" => Ok(EcdsaSighashType::All),
             "SIGHASH_NONE" => Ok(EcdsaSighashType::None),
             "SIGHASH_SINGLE" => Ok(EcdsaSighashType::Single),
+            "SIGHASH_ALL|SIGHASH_RANGEPROOF" => Ok(EcdsaSighashType::AllPlusRangeproof),
+            "SIGHASH_NONE|SIGHASH_RANGEPROOF" => Ok(EcdsaSighashType::NonePlusRangeproof),
+            "SIGHASH_SINGLE|SIGHASH_RANGEPROOF" => Ok(EcdsaSighashType::SinglePlusRangeproof),
             "SIGHASH_ALL|SIGHASH_ANYONECANPAY" => Ok(EcdsaSighashType::AllPlusAnyoneCanPay),
             "SIGHASH_NONE|SIGHASH_ANYONECANPAY" => Ok(EcdsaSighashType::NonePlusAnyoneCanPay),
             "SIGHASH_SINGLE|SIGHASH_ANYONECANPAY" => Ok(EcdsaSighashType::SinglePlusAnyoneCanPay),
+            "SIGHASH_ALL|SIGHASH_ANYONECANPAY|SIGHASH_RANGEPROOF" => Ok(EcdsaSighashType::AllPlusAnyoneCanPayPlusRangeproof),
+            "SIGHASH_NONE|SIGHASH_ANYONECANPAY|SIGHASH_RANGEPROOF" => Ok(EcdsaSighashType::NonePlusAnyoneCanPayPlusRangeproof),
+            "SIGHASH_SINGLE|SIGHASH_ANYONECANPAY|SIGHASH_RANGEPROOF" => Ok(EcdsaSighashType::SinglePlusAnyoneCanPayPlusRangeproof),
             _ => Err("can't recognize SIGHASH string".to_string())
         }
     }
 }
 
 impl EcdsaSighashType {
-    /// Break the sighash flag into the "real" sighash flag and the ANYONECANPAY boolean
-    pub(crate) fn split_anyonecanpay_flag(self) -> (EcdsaSighashType, bool) {
+    /// Break the sighash type into its output mode, ANYONECANPAY flag, and RANGEPROOF flag.
+    pub(crate) fn split_flags(self) -> (EcdsaSighashType, bool, bool) {
         match self {
-            EcdsaSighashType::All => (EcdsaSighashType::All, false),
-            EcdsaSighashType::None => (EcdsaSighashType::None, false),
-            EcdsaSighashType::Single => (EcdsaSighashType::Single, false),
-            EcdsaSighashType::AllPlusAnyoneCanPay => (EcdsaSighashType::All, true),
-            EcdsaSighashType::NonePlusAnyoneCanPay => (EcdsaSighashType::None, true),
-            EcdsaSighashType::SinglePlusAnyoneCanPay => (EcdsaSighashType::Single, true),
+            EcdsaSighashType::All => (EcdsaSighashType::All, false, false),
+            EcdsaSighashType::None => (EcdsaSighashType::None, false, false),
+            EcdsaSighashType::Single => (EcdsaSighashType::Single, false, false),
+            EcdsaSighashType::AllPlusRangeproof => (EcdsaSighashType::All, false, true),
+            EcdsaSighashType::NonePlusRangeproof => (EcdsaSighashType::None, false, true),
+            EcdsaSighashType::SinglePlusRangeproof => (EcdsaSighashType::Single, false, true),
+            EcdsaSighashType::AllPlusAnyoneCanPay => (EcdsaSighashType::All, true, false),
+            EcdsaSighashType::NonePlusAnyoneCanPay => (EcdsaSighashType::None, true, false),
+            EcdsaSighashType::SinglePlusAnyoneCanPay => (EcdsaSighashType::Single, true, false),
+            EcdsaSighashType::AllPlusAnyoneCanPayPlusRangeproof => (EcdsaSighashType::All, true, true),
+            EcdsaSighashType::NonePlusAnyoneCanPayPlusRangeproof => (EcdsaSighashType::None, true, true),
+            EcdsaSighashType::SinglePlusAnyoneCanPayPlusRangeproof => (EcdsaSighashType::Single, true, true),
         }
     }
 
     /// Reads a 4-byte uint32 as a sighash type
     pub fn from_u32(n: u32) -> EcdsaSighashType {
-        match n & 0x9f {
+        match n & 0xdf {
             // "real" sighashes
             0x01 => EcdsaSighashType::All,
             0x02 => EcdsaSighashType::None,
             0x03 => EcdsaSighashType::Single,
+            0x41 => EcdsaSighashType::AllPlusRangeproof,
+            0x42 => EcdsaSighashType::NonePlusRangeproof,
+            0x43 => EcdsaSighashType::SinglePlusRangeproof,
             0x81 => EcdsaSighashType::AllPlusAnyoneCanPay,
             0x82 => EcdsaSighashType::NonePlusAnyoneCanPay,
             0x83 => EcdsaSighashType::SinglePlusAnyoneCanPay,
+            0xc1 => EcdsaSighashType::AllPlusAnyoneCanPayPlusRangeproof,
+            0xc2 => EcdsaSighashType::NonePlusAnyoneCanPayPlusRangeproof,
+            0xc3 => EcdsaSighashType::SinglePlusAnyoneCanPayPlusRangeproof,
             // catchalls
+            x if x & 0xc0 == 0xc0 => EcdsaSighashType::AllPlusAnyoneCanPayPlusRangeproof,
             x if x & 0x80 == 0x80 => EcdsaSighashType::AllPlusAnyoneCanPay,
+            x if x & 0x40 == 0x40 => EcdsaSighashType::AllPlusRangeproof,
             _ => EcdsaSighashType::All,
         }
     }
@@ -1155,9 +1193,15 @@ impl EcdsaSighashType {
             0x01 => Ok(EcdsaSighashType::All),
             0x02 => Ok(EcdsaSighashType::None),
             0x03 => Ok(EcdsaSighashType::Single),
+            0x41 => Ok(EcdsaSighashType::AllPlusRangeproof),
+            0x42 => Ok(EcdsaSighashType::NonePlusRangeproof),
+            0x43 => Ok(EcdsaSighashType::SinglePlusRangeproof),
             0x81 => Ok(EcdsaSighashType::AllPlusAnyoneCanPay),
             0x82 => Ok(EcdsaSighashType::NonePlusAnyoneCanPay),
             0x83 => Ok(EcdsaSighashType::SinglePlusAnyoneCanPay),
+            0xc1 => Ok(EcdsaSighashType::AllPlusAnyoneCanPayPlusRangeproof),
+            0xc2 => Ok(EcdsaSighashType::NonePlusAnyoneCanPayPlusRangeproof),
+            0xc3 => Ok(EcdsaSighashType::SinglePlusAnyoneCanPayPlusRangeproof),
             non_standard => Err(NonStandardSighashType(non_standard))
         }
     }
