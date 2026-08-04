@@ -675,7 +675,17 @@ impl<R: Deref<Target = Transaction>> SighashCache<R> {
         // cannot encode tx directly because of different consensus encoding
         // of elements tx(they include witness flag even for non-witness transactions)
         tx.version.consensus_encode(&mut writer)?;
-        tx.input.consensus_encode(&mut writer)?;
+        // Elements legacy sighashes serialize outpoints without the issuance and
+        // pegin flags that normal transaction input encoding places in `vout`.
+        VarInt(tx.input.len() as u64).consensus_encode(&mut writer)?;
+        for input in &tx.input {
+            input.previous_output.consensus_encode(&mut writer)?;
+            input.script_sig.consensus_encode(&mut writer)?;
+            input.sequence.consensus_encode(&mut writer)?;
+            if input.has_issuance() {
+                input.asset_issuance.consensus_encode(&mut writer)?;
+            }
+        }
         if rangeproof {
             VarInt(tx.output.len() as u64).consensus_encode(&mut writer)?;
             for (index, output) in tx.output.iter().enumerate() {
@@ -1055,7 +1065,35 @@ mod tests{
         test_legacy_sighash("010000000001715df5ccebaf02ff18d6fae7263fa69fed5de59c900f4749556eba41bc7bf2af0000000000000000000201230f4f5d4b7c6fa845806ee4f67713459e1b69e8e60fcee2e4940c7a0d5de1b2010000000124101100001f5175517551755175517551755175517551755175517551755175517551755101230f4f5d4b7c6fa845806ee4f67713459e1b69e8e60fcee2e4940c7a0d5de1b2010000000005f5e100000000000000", "76a914f54a5851e9372b87810a8e60cdd2e7cfd80b6e3188ac", 0, EcdsaSighashType::SinglePlusAnyoneCanPay, "4c18486c473dc31c264c477c55e9c17d70fddb9f567c7d411ce922261577167c");
 
         // Test a issuance test with only sighash all
-        test_legacy_sighash("010000000001715df5ccebaf02ff18d6fae7263fa69fed5de59c900f4749556eba41bc7bf2af000000800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000003e801000000000000000a0201230f4f5d4b7c6fa845806ee4f67713459e1b69e8e60fcee2e4940c7a0d5de1b2010000000124101100001f5175517551755175517551755175517551755175517551755175517551755101230f4f5d4b7c6fa845806ee4f67713459e1b69e8e60fcee2e4940c7a0d5de1b2010000000005f5e100000000000000", "76a914f54a5851e9372b87810a8e60cdd2e7cfd80b6e3188ac", 0, EcdsaSighashType::All, "9f00e1758a230aaf6c9bce777701a604f50b2ac5f2a07e1cd478d8a0e70fc195");
+        test_legacy_sighash("010000000001715df5ccebaf02ff18d6fae7263fa69fed5de59c900f4749556eba41bc7bf2af000000800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000000003e801000000000000000a0201230f4f5d4b7c6fa845806ee4f67713459e1b69e8e60fcee2e4940c7a0d5de1b2010000000124101100001f5175517551755175517551755175517551755175517551755175517551755101230f4f5d4b7c6fa845806ee4f67713459e1b69e8e60fcee2e4940c7a0d5de1b2010000000005f5e100000000000000", "76a914f54a5851e9372b87810a8e60cdd2e7cfd80b6e3188ac", 0, EcdsaSighashType::All, "7df7980d94f19d1c7e4f64c1a5fa1da57d2fdeb2452bcf77feab35246aac8030");
+    }
+
+    #[test]
+    fn legacy_sighash_omits_pegin_outpoint_flag() {
+        let tx = Transaction {
+            version: 2,
+            lock_time: crate::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: crate::OutPoint::new(crate::Txid::from_byte_array([0; 32]), 7),
+                is_pegin: true,
+                script_sig: Script::new(),
+                sequence: Sequence::MAX,
+                asset_issuance: crate::AssetIssuance::default(),
+                witness: TxInWitness::default(),
+            }],
+            output: vec![],
+        };
+        let mut preimage = Vec::new();
+        SighashCache::new(&tx)
+            .encode_legacy_signing_data_to(
+                &mut preimage,
+                0,
+                &Script::new(),
+                EcdsaSighashType::All,
+            )
+            .unwrap();
+
+        assert_eq!(&preimage[37..41], &[7, 0, 0, 0]);
     }
 
     #[test]
