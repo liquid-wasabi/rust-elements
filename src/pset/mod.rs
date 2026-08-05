@@ -20,7 +20,7 @@
 //! Extension for PSET is based on PSET defined in BIP370.
 //! <https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki>
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::{cmp, io};
 
 mod error;
@@ -41,7 +41,7 @@ pub use self::str::ParseError;
 use crate::confidential;
 use crate::encode::{self, Decodable, Encodable};
 use crate::{
-    blind::RangeProofMessage,
+    blind::{ConfidentialTxOutError, RangeProofMessage, SurjectionProofInputMode},
     confidential::{AssetBlindingFactor, ValueBlindingFactor},
     RangeProof, SurjectionProof, TxOutSecrets,
 };
@@ -50,9 +50,12 @@ use crate::{
     TxInWitness, TxOut, TxOutWitness, Txid, CtLocation, CtLocationType,
 };
 use secp256k1_zkp::rand::{CryptoRng, RngCore};
-use secp256k1_zkp::{self, SecretKey};
+use secp256k1_zkp::{self, Generator, SecretKey, Signing, Verification};
 
-pub use self::error::{Error, PsetBlindError, PsetHash};
+pub use self::error::{
+    Error, PsetAllSurjectionProofBlindError, PsetBlindError, PsetHash,
+    PsetSurjectionProofError,
+};
 use self::map::Map;
 pub use self::map::{Global, GlobalTxData, Input, Output, PsbtSighashType, TapTree};
 
@@ -470,6 +473,109 @@ impl PartiallySignedTransaction {
         Ok(ret)
     }
 
+    /// Verifies that every confidential output's surjection proof selects and
+    /// cryptographically commits to the exact current ordered PSET input domain.
+    ///
+    /// The domain contains each spent-output asset generator followed by that
+    /// input's issuance and reissuance generators, when present. Call this after
+    /// the final blinder and before signatures are created. Any later input,
+    /// issuance, witness-UTXO, or output-commitment mutation requires another
+    /// successful verification. `expected_confidential_outputs` must come from
+    /// the caller's immutable final transaction projection, not from this
+    /// potentially untrusted PSET.
+    pub fn verify_all_surjection_proofs_use_all_inputs<C>(
+        &self,
+        secp: &secp256k1_zkp::Secp256k1<C>,
+        expected_confidential_outputs: &[usize],
+    ) -> Result<(), PsetSurjectionProofError>
+    where
+        C: Signing + Verification,
+    {
+        let mut domain = Vec::new();
+        for (input_index, input) in self.inputs.iter().enumerate() {
+            let witness_utxo = input
+                .witness_utxo
+                .as_ref()
+                .ok_or(PsetSurjectionProofError::MissingWitnessUtxo(input_index))?;
+            let input_generator = match witness_utxo.asset {
+                confidential::Asset::Null => {
+                    return Err(PsetSurjectionProofError::NullInputAsset(input_index));
+                }
+                confidential::Asset::Explicit(asset) => {
+                    Generator::new_unblinded(secp, asset.into_tag())
+                }
+                confidential::Asset::Confidential(generator) => generator,
+            };
+            domain.push(input_generator);
+
+            if input.has_issuance() {
+                let (asset_id, token_id) = input.issuance_ids();
+                if input.issuance_value_amount.is_some() || input.issuance_value_comm.is_some() {
+                    domain.push(Generator::new_unblinded(secp, asset_id.into_tag()));
+                }
+                if input.issuance_inflation_keys.is_some()
+                    || input.issuance_inflation_keys_comm.is_some()
+                {
+                    domain.push(Generator::new_unblinded(secp, token_id.into_tag()));
+                }
+            }
+        }
+
+        let mut outputs_to_verify = BTreeSet::new();
+        for &output_index in expected_confidential_outputs {
+            if output_index >= self.outputs.len() {
+                return Err(PsetSurjectionProofError::OutputIndexOutOfBounds(
+                    output_index,
+                ));
+            }
+            outputs_to_verify.insert(output_index);
+        }
+        for (output_index, output) in self.outputs.iter().enumerate() {
+            let has_confidential_data = output.blinding_key.is_some()
+                || output.blinder_index.is_some()
+                || output.amount_comm.is_some()
+                || output.asset_comm.is_some()
+                || output.value_rangeproof.is_some()
+                || output.asset_surjection_proof.is_some()
+                || output.ecdh_pubkey.is_some()
+                || output.blind_value_proof.is_some()
+                || output.blind_asset_proof.is_some();
+            if has_confidential_data {
+                outputs_to_verify.insert(output_index);
+            }
+        }
+
+        for output_index in outputs_to_verify {
+            let output = &self.outputs[output_index];
+            let asset_commitment = output
+                .asset_comm
+                .ok_or(PsetSurjectionProofError::MissingAssetCommitment(output_index))?;
+            let proof = output
+                .asset_surjection_proof
+                .as_ref()
+                .ok_or(PsetSurjectionProofError::MissingSurjectionProof(output_index))?;
+            let actual_input_count = proof.input_count();
+            if actual_input_count != domain.len() {
+                return Err(PsetSurjectionProofError::InputCountMismatch {
+                    output_index,
+                    expected: domain.len(),
+                    actual: actual_input_count,
+                });
+            }
+            if !proof.uses_all_inputs() {
+                return Err(PsetSurjectionProofError::DoesNotUseAllInputs(output_index));
+            }
+            let verifies = proof
+                .as_ref()
+                .is_some_and(|inner| inner.verify(secp, asset_commitment, &domain));
+            if !verifies {
+                return Err(PsetSurjectionProofError::VerificationFailed(output_index));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Blind the pset as the non-last blinder role. The last blinder of pset
     /// should call the `blind_last` function which balances the blinding factors
     /// `inp_secrets` and must be consistent by [`Output`] `blinder_index` field
@@ -490,6 +596,54 @@ impl PartiallySignedTransaction {
         secp: &secp256k1_zkp::Secp256k1<C>,
         inp_txout_sec: &HashMap<usize, TxOutSecrets>,
     ) -> Result<BTreeMap<CtLocation, (AssetBlindingFactor, ValueBlindingFactor, SecretKey)>, PsetBlindError> {
+        self.blind_non_last_with_surjection_input_mode(
+            rng,
+            secp,
+            inp_txout_sec,
+            SurjectionProofInputMode::Default,
+        )
+    }
+
+    /// Blinds this blinder's non-last outputs with every current surjection-domain
+    /// entry selected in each transaction-output surjection proof.
+    ///
+    /// The PSET input set must be final before calling this method. Adding an input
+    /// afterward means the created proofs no longer cover every final input. The
+    /// operation fails if the complete domain exceeds the upstream proof limit.
+    /// The PSET is unchanged on error, although the caller's RNG may advance.
+    pub fn blind_non_last_with_all_surjection_inputs<
+        C: secp256k1_zkp::Signing,
+        R: RngCore + CryptoRng,
+    >(
+        &mut self,
+        rng: &mut R,
+        secp: &secp256k1_zkp::Secp256k1<C>,
+        inp_txout_sec: &HashMap<usize, TxOutSecrets>,
+    ) -> Result<
+        BTreeMap<CtLocation, (AssetBlindingFactor, ValueBlindingFactor, SecretKey)>,
+        PsetAllSurjectionProofBlindError,
+    > {
+        let mut staged = self.clone();
+        let result = staged.blind_non_last_with_surjection_input_mode(
+            rng,
+            secp,
+            inp_txout_sec,
+            SurjectionProofInputMode::All,
+        )?;
+        *self = staged;
+        Ok(result)
+    }
+
+    fn blind_non_last_with_surjection_input_mode<
+        C: secp256k1_zkp::Signing,
+        R: RngCore + CryptoRng,
+    >(
+        &mut self,
+        rng: &mut R,
+        secp: &secp256k1_zkp::Secp256k1<C>,
+        inp_txout_sec: &HashMap<usize, TxOutSecrets>,
+        input_mode: SurjectionProofInputMode,
+    ) -> Result<BTreeMap<CtLocation, (AssetBlindingFactor, ValueBlindingFactor, SecretKey)>, PsetBlindError> {
         let (inp_secrets, outs_to_blind) = self.blind_checks(inp_txout_sec)?;
 
         let mut ret = BTreeMap::new(); // return all the random values used
@@ -503,7 +657,7 @@ impl PartiallySignedTransaction {
         for i in outs_to_blind {
             let txout = self.outputs[i].to_txout();
             let (txout, abf, vbf, ephemeral_sk) = txout
-                .to_non_last_confidential(
+                .to_non_last_confidential_with_surjection_input_mode(
                     rng,
                     secp,
                     self.outputs[i]
@@ -511,6 +665,7 @@ impl PartiallySignedTransaction {
                         .map(|x| x.inner)
                         .ok_or(PsetBlindError::MustHaveExplicitTxOut(i))?,
                     &surject_inputs,
+                    input_mode,
                 )
                 .map_err(|e| PsetBlindError::ConfidentialTxOutError(i, e))?;
             let value = self.outputs[i]
@@ -592,12 +747,80 @@ impl PartiallySignedTransaction {
         secp: &secp256k1_zkp::Secp256k1<C>,
         inp_txout_sec: &HashMap<usize, TxOutSecrets>,
     ) -> Result<BTreeMap<CtLocation, (AssetBlindingFactor, ValueBlindingFactor, SecretKey)>, PsetBlindError> {
+        self.blind_last_with_surjection_input_mode(
+            rng,
+            secp,
+            inp_txout_sec,
+            SurjectionProofInputMode::Default,
+        )
+    }
+
+    /// Blinds this last blinder's outputs with every current surjection-domain
+    /// entry selected in each transaction-output surjection proof.
+    ///
+    /// The PSET input set must be final before calling this method. Every earlier
+    /// non-last blinder must use
+    /// [`Self::blind_non_last_with_all_surjection_inputs`] over the same final input
+    /// set. Before committing changes, this verifies every confidential output
+    /// against the exact current domain and rejects mixed blinding policies. The
+    /// operation fails if the complete domain exceeds the upstream proof limit.
+    /// The PSET is unchanged on error, although the caller's RNG may advance.
+    pub fn blind_last_with_all_surjection_inputs<C, R>(
+        &mut self,
+        rng: &mut R,
+        secp: &secp256k1_zkp::Secp256k1<C>,
+        inp_txout_sec: &HashMap<usize, TxOutSecrets>,
+        expected_confidential_outputs: &[usize],
+    ) -> Result<
+        BTreeMap<CtLocation, (AssetBlindingFactor, ValueBlindingFactor, SecretKey)>,
+        PsetAllSurjectionProofBlindError,
+    >
+    where
+        C: Signing + Verification,
+        R: RngCore + CryptoRng,
+    {
+        let mut staged = self.clone();
+        let result = staged.blind_last_with_surjection_input_mode(
+            rng,
+            secp,
+            inp_txout_sec,
+            SurjectionProofInputMode::All,
+        )?;
+        staged.verify_all_surjection_proofs_use_all_inputs(
+            secp,
+            expected_confidential_outputs,
+        )?;
+        *self = staged;
+        Ok(result)
+    }
+
+    fn blind_last_with_surjection_input_mode<
+        C: secp256k1_zkp::Signing,
+        R: RngCore + CryptoRng,
+    >(
+        &mut self,
+        rng: &mut R,
+        secp: &secp256k1_zkp::Secp256k1<C>,
+        inp_txout_sec: &HashMap<usize, TxOutSecrets>,
+        input_mode: SurjectionProofInputMode,
+    ) -> Result<BTreeMap<CtLocation, (AssetBlindingFactor, ValueBlindingFactor, SecretKey)>, PsetBlindError> {
         let (mut inp_secrets, mut outs_to_blind) = self.blind_checks(inp_txout_sec)?;
 
         let mut ret = BTreeMap::new();
         if outs_to_blind.is_empty() {
             // Atleast one output must be marked for blinding for pset blind_last
             return Err(PsetBlindError::AtleastOneOutputBlind);
+        }
+        let surject_inputs = self.surjection_inputs(inp_txout_sec)?;
+        if matches!(input_mode, SurjectionProofInputMode::All)
+            && surject_inputs.len() > secp256k1_zkp::MAX_SURJECTION_PROOF_INPUTS
+        {
+            return Err(PsetBlindError::ConfidentialTxOutError(
+                outs_to_blind[0],
+                ConfidentialTxOutError::Upstream(
+                    secp256k1_zkp::Error::CannotProveSurjection,
+                ),
+            ));
         }
         // If there are more than 1 outs to blind
         // blind all outs but the last one
@@ -607,7 +830,12 @@ impl PartiallySignedTransaction {
             let ind = self.outputs[last_out_index].blinder_index;
             self.outputs[last_out_index].blinder_index = None;
             // Blind normally without the last index
-            ret = self.blind_non_last(rng, secp, inp_txout_sec)?;
+            ret = self.blind_non_last_with_surjection_input_mode(
+                rng,
+                secp,
+                inp_txout_sec,
+                input_mode,
+            )?;
             // Restore who blinded the last output
             self.outputs[last_out_index].blinder_index = ind;
             // inp_secrets contributed to self.global.scalars, unset it so we don't count them
@@ -616,13 +844,18 @@ impl PartiallySignedTransaction {
         }
         // blind the last txout
 
-        let surject_inputs = self.surjection_inputs(inp_txout_sec)?;
         let asset_id = self.outputs[last_out_index]
             .asset
             .ok_or(PsetBlindError::MustHaveExplicitTxOut(last_out_index))?;
         let out_abf = AssetBlindingFactor::new(rng);
         let exp_asset = confidential::Asset::Explicit(asset_id);
-        let blind_res = exp_asset.blind(rng, secp, out_abf, &surject_inputs);
+        let blind_res = exp_asset.blind_with_surjection_input_mode(
+            rng,
+            secp,
+            out_abf,
+            &surject_inputs,
+            input_mode,
+        );
 
         let (out_asset_commitment, surjection_proof) =
             blind_res.map_err(|e| PsetBlindError::ConfidentialTxOutError(last_out_index, e))?;
@@ -786,6 +1019,533 @@ mod tests {
     use super::*;
     use crate::OutPoint;
     use hex::DisplayHex as _;
+    use std::convert::TryFrom;
+
+    fn pset_with_explicit_inputs(
+        input_count: usize,
+        blinded_output_values: &[u64],
+    ) -> (PartiallySignedTransaction, HashMap<usize, TxOutSecrets>) {
+        use crate::confidential::{Asset, Nonce, Value};
+        use crate::{AssetId, Script};
+        use std::str::FromStr;
+
+        let asset = AssetId::from_byte_array([42; 32]);
+        let script = Script::from_hex_no_prefix(
+            "0014d2bcde17e7744f6377466ca1bd35d212954674c8",
+        )
+        .unwrap();
+        let blinding_key = bitcoin::PublicKey::from_str(
+            "020202020202020202020202020202020202020202020202020202020202020202",
+        )
+        .unwrap();
+        let input_value = 1_000;
+        let total_input_value = input_value * input_count as u64;
+        let total_blinded_output_value = blinded_output_values.iter().sum::<u64>();
+        let fee = total_input_value.checked_sub(total_blinded_output_value).unwrap();
+
+        let mut pset = PartiallySignedTransaction::new_v2();
+        let mut input_secrets = HashMap::new();
+        for input_index in 0..input_count {
+            let outpoint = OutPoint {
+                vout: input_index as u32,
+                ..Default::default()
+            };
+            let witness_utxo = TxOut {
+                asset: Asset::Explicit(asset),
+                value: Value::Explicit(input_value),
+                nonce: Nonce::Null,
+                script_pubkey: script.clone(),
+                witness: TxOutWitness::default(),
+            };
+            let mut input = Input::from_prevout(outpoint);
+            input.witness_utxo = Some(witness_utxo);
+            pset.add_input(input);
+            input_secrets.insert(
+                input_index,
+                TxOutSecrets::new(
+                    asset,
+                    AssetBlindingFactor::zero(),
+                    input_value,
+                    ValueBlindingFactor::zero(),
+                ),
+            );
+        }
+
+        for value in blinded_output_values {
+            let mut output = Output::new_explicit(
+                script.clone(),
+                *value,
+                asset,
+                Some(blinding_key),
+            );
+            output.blinder_index = Some(0);
+            pset.add_output(output);
+        }
+        pset.add_output(Output::new_explicit(Script::new(), fee, asset, None));
+
+        (pset, input_secrets)
+    }
+
+    fn pset_with_distinct_confidential_inputs(
+        input_count: usize,
+        blinded_output_values: &[u64],
+    ) -> (PartiallySignedTransaction, HashMap<usize, TxOutSecrets>) {
+        use crate::confidential::Asset;
+
+        let secp = secp256k1_zkp::Secp256k1::new();
+        let (mut pset, mut input_secrets) =
+            pset_with_explicit_inputs(input_count, blinded_output_values);
+        for (input_index, input) in pset.inputs_mut().iter_mut().enumerate() {
+            let asset_bf = AssetBlindingFactor::from_byte_array([
+                u8::try_from(input_index + 1).unwrap();
+                32
+            ])
+            .unwrap();
+            let secrets = input_secrets.get_mut(&input_index).unwrap();
+            input.witness_utxo.as_mut().unwrap().asset =
+                Asset::new_confidential(&secp, secrets.asset, asset_bf);
+            secrets.asset_bf = asset_bf;
+        }
+        for (output_index, output) in pset.outputs_mut()[..blinded_output_values.len()]
+            .iter_mut()
+            .enumerate()
+        {
+            output.blinder_index = Some(output_index as u32);
+        }
+
+        (pset, input_secrets)
+    }
+
+    fn input_secret(
+        input_secrets: &HashMap<usize, TxOutSecrets>,
+        input_index: usize,
+    ) -> HashMap<usize, TxOutSecrets> {
+        HashMap::from([(input_index, input_secrets[&input_index])])
+    }
+
+    fn surjection_proof_input_count(proof: &SurjectionProof) -> usize {
+        proof.input_count()
+    }
+
+    fn surjection_proof_used_input_count(proof: &SurjectionProof) -> usize {
+        proof.used_input_count()
+    }
+
+    fn assert_surjection_proof_uses_all_inputs(proof: &SurjectionProof, input_count: usize) {
+        let bytes = proof.to_vec();
+        let proof_input_count = surjection_proof_input_count(proof);
+        assert_eq!(proof_input_count, input_count);
+        assert_eq!(surjection_proof_used_input_count(proof), input_count);
+        assert!(proof.uses_all_inputs());
+
+        let bitmap = &bytes[2..2 + input_count.div_ceil(8)];
+        for input_index in 0..input_count {
+            assert_ne!(bitmap[input_index / 8] & (1 << (input_index % 8)), 0);
+        }
+        for padding_index in input_count..bitmap.len() * 8 {
+            assert_eq!(bitmap[padding_index / 8] & (1 << (padding_index % 8)), 0);
+        }
+    }
+
+    #[test]
+    fn all_surjection_inputs_cover_every_final_pset_input() {
+        use rand::{rngs::StdRng, SeedableRng};
+
+        let secp = secp256k1_zkp::Secp256k1::new();
+        let mut rng = StdRng::seed_from_u64(7);
+        let (mut pset, input_secrets) = pset_with_explicit_inputs(4, &[1_000, 2_500]);
+
+        pset
+            .blind_last_with_all_surjection_inputs(&mut rng, &secp, &input_secrets, &[0, 1])
+            .unwrap();
+
+        for output in &pset.outputs()[..2] {
+            assert_surjection_proof_uses_all_inputs(
+                output.asset_surjection_proof.as_ref().unwrap(),
+                4,
+            );
+        }
+
+        let spent_utxos = pset
+            .inputs()
+            .iter()
+            .map(|input| input.witness_utxo.clone().unwrap())
+            .collect::<Vec<_>>();
+        pset
+            .extract_tx()
+            .unwrap()
+            .verify_tx_amt_proofs(&secp, &spent_utxos)
+            .unwrap();
+    }
+
+    #[test]
+    fn default_pset_blinding_keeps_three_input_surjection_ring() {
+        use rand::{rngs::StdRng, SeedableRng};
+
+        let secp = secp256k1_zkp::Secp256k1::new();
+        let mut rng = StdRng::seed_from_u64(8);
+        let (mut pset, input_secrets) = pset_with_explicit_inputs(4, &[3_500]);
+
+        pset.blind_last(&mut rng, &secp, &input_secrets).unwrap();
+
+        let proof = pset.outputs()[0].asset_surjection_proof.as_ref().unwrap();
+        assert_eq!(surjection_proof_input_count(proof), 4);
+        assert_eq!(surjection_proof_used_input_count(proof), 3);
+        assert!(!proof.uses_all_inputs());
+    }
+
+    #[test]
+    fn empty_surjection_proof_does_not_report_all_inputs() {
+        assert_eq!(SurjectionProof::EMPTY.input_count(), 0);
+        assert_eq!(SurjectionProof::EMPTY.used_input_count(), 0);
+        assert!(!SurjectionProof::EMPTY.uses_all_inputs());
+    }
+
+    #[test]
+    fn all_surjection_inputs_accept_maximum_domain() {
+        use rand::{rngs::StdRng, SeedableRng};
+
+        let secp = secp256k1_zkp::Secp256k1::new();
+        let mut rng = StdRng::seed_from_u64(10);
+        let (mut pset, input_secrets) = pset_with_explicit_inputs(256, &[255_500]);
+
+        pset
+            .blind_last_with_all_surjection_inputs(&mut rng, &secp, &input_secrets, &[0])
+            .unwrap();
+
+        assert_surjection_proof_uses_all_inputs(
+            pset.outputs()[0].asset_surjection_proof.as_ref().unwrap(),
+            256,
+        );
+    }
+
+    #[test]
+    fn all_surjection_inputs_reject_oversized_domain_before_mutation() {
+        use rand::{rngs::StdRng, SeedableRng};
+
+        let secp = secp256k1_zkp::Secp256k1::new();
+        let mut rng = StdRng::seed_from_u64(9);
+        let (mut pset, input_secrets) = pset_with_explicit_inputs(257, &[500, 256_000]);
+        let original = pset.clone();
+
+        let error = pset
+            .blind_last_with_all_surjection_inputs(&mut rng, &secp, &input_secrets, &[0, 1])
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            PsetAllSurjectionProofBlindError::Blinding(
+                PsetBlindError::ConfidentialTxOutError(0, _)
+            )
+        ));
+        assert_eq!(pset, original);
+    }
+
+    #[test]
+    fn all_surjection_inputs_support_distinct_multiparty_input_commitments() {
+        use rand::{rngs::StdRng, SeedableRng};
+
+        let secp = secp256k1_zkp::Secp256k1::new();
+        let mut rng = StdRng::seed_from_u64(11);
+        let (mut pset, input_secrets) =
+            pset_with_distinct_confidential_inputs(4, &[900, 900, 900, 800]);
+
+        for input_index in 0..3 {
+            pset
+                .blind_non_last_with_all_surjection_inputs(
+                    &mut rng,
+                    &secp,
+                    &input_secret(&input_secrets, input_index),
+                )
+                .unwrap();
+        }
+        pset
+            .blind_last_with_all_surjection_inputs(
+                &mut rng,
+                &secp,
+                &input_secret(&input_secrets, 3),
+                &[0, 1, 2, 3],
+            )
+            .unwrap();
+        pset
+            .verify_all_surjection_proofs_use_all_inputs(&secp, &[0, 1, 2, 3])
+            .unwrap();
+
+        for output in &pset.outputs()[..4] {
+            assert_surjection_proof_uses_all_inputs(
+                output.asset_surjection_proof.as_ref().unwrap(),
+                4,
+            );
+        }
+        let spent_utxos = pset
+            .inputs()
+            .iter()
+            .map(|input| input.witness_utxo.clone().unwrap())
+            .collect::<Vec<_>>();
+        pset
+            .extract_tx()
+            .unwrap()
+            .verify_tx_amt_proofs(&secp, &spent_utxos)
+            .unwrap();
+    }
+
+    #[test]
+    fn all_surjection_inputs_reject_mixed_participant_policy_atomically() {
+        use rand::{rngs::StdRng, SeedableRng};
+
+        let secp = secp256k1_zkp::Secp256k1::new();
+        let mut rng = StdRng::seed_from_u64(12);
+        let (mut pset, input_secrets) =
+            pset_with_distinct_confidential_inputs(4, &[900, 900, 900, 800]);
+
+        pset
+            .blind_non_last(&mut rng, &secp, &input_secret(&input_secrets, 0))
+            .unwrap();
+        for input_index in 1..3 {
+            pset
+                .blind_non_last_with_all_surjection_inputs(
+                    &mut rng,
+                    &secp,
+                    &input_secret(&input_secrets, input_index),
+                )
+                .unwrap();
+        }
+        let before_final_blinder = pset.clone();
+
+        let error = pset
+            .blind_last_with_all_surjection_inputs(
+                &mut rng,
+                &secp,
+                &input_secret(&input_secrets, 3),
+                &[0, 1, 2, 3],
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            PsetAllSurjectionProofBlindError::Policy(
+                PsetSurjectionProofError::DoesNotUseAllInputs(0)
+            )
+        );
+        assert_eq!(pset, before_final_blinder);
+    }
+
+    #[test]
+    fn all_surjection_input_blinding_errors_are_failure_atomic() {
+        use rand::{rngs::StdRng, SeedableRng};
+
+        let secp = secp256k1_zkp::Secp256k1::new();
+        let other_asset = crate::AssetId::from_byte_array([43; 32]);
+
+        let (mut non_last_pset, input_secrets) =
+            pset_with_explicit_inputs(2, &[500, 1_000]);
+        non_last_pset.outputs_mut()[1].asset = Some(other_asset);
+        let original_non_last = non_last_pset.clone();
+        let mut non_last_rng = StdRng::seed_from_u64(13);
+        non_last_pset
+            .blind_non_last_with_all_surjection_inputs(
+                &mut non_last_rng,
+                &secp,
+                &input_secrets,
+            )
+            .unwrap_err();
+        assert_eq!(non_last_pset, original_non_last);
+
+        let (mut last_pset, input_secrets) = pset_with_explicit_inputs(2, &[500, 1_000]);
+        last_pset.outputs_mut()[1].asset = Some(other_asset);
+        let original_last = last_pset.clone();
+        let mut last_rng = StdRng::seed_from_u64(14);
+        last_pset
+            .blind_last_with_all_surjection_inputs(
+                &mut last_rng,
+                &secp,
+                &input_secrets,
+                &[0, 1],
+            )
+            .unwrap_err();
+        assert_eq!(last_pset, original_last);
+    }
+
+    #[test]
+    fn all_surjection_input_policy_binds_the_exact_final_domain() {
+        use rand::{rngs::StdRng, SeedableRng};
+
+        let secp = secp256k1_zkp::Secp256k1::new();
+        let mut rng = StdRng::seed_from_u64(15);
+        let (mut pset, input_secrets) =
+            pset_with_distinct_confidential_inputs(4, &[900, 900, 900, 800]);
+        for input_index in 0..3 {
+            pset
+                .blind_non_last_with_all_surjection_inputs(
+                    &mut rng,
+                    &secp,
+                    &input_secret(&input_secrets, input_index),
+                )
+                .unwrap();
+        }
+        pset
+            .blind_last_with_all_surjection_inputs(
+                &mut rng,
+                &secp,
+                &input_secret(&input_secrets, 3),
+                &[0, 1, 2, 3],
+            )
+            .unwrap();
+
+        let encoded = encode::serialize(&pset);
+        let decoded: PartiallySignedTransaction = encode::deserialize(&encoded).unwrap();
+        decoded
+            .verify_all_surjection_proofs_use_all_inputs(&secp, &[0, 1, 2, 3])
+            .unwrap();
+
+        let mut stripped = pset.clone();
+        let stripped_output = &mut stripped.outputs_mut()[0];
+        stripped_output.blinding_key = None;
+        stripped_output.blinder_index = None;
+        stripped_output.amount_comm = None;
+        stripped_output.asset_comm = None;
+        stripped_output.value_rangeproof = None;
+        stripped_output.asset_surjection_proof = None;
+        stripped_output.ecdh_pubkey = None;
+        stripped_output.blind_value_proof = None;
+        stripped_output.blind_asset_proof = None;
+        assert_eq!(
+            stripped.verify_all_surjection_proofs_use_all_inputs(&secp, &[0, 1, 2, 3]),
+            Err(PsetSurjectionProofError::MissingAssetCommitment(0))
+        );
+        assert_eq!(
+            pset.verify_all_surjection_proofs_use_all_inputs(&secp, &[0, 1, 2, 3, 5]),
+            Err(PsetSurjectionProofError::OutputIndexOutOfBounds(5))
+        );
+
+        let mut added = pset.clone();
+        added.add_input(pset.inputs()[0].clone());
+        assert!(matches!(
+            added.verify_all_surjection_proofs_use_all_inputs(&secp, &[0, 1, 2, 3]),
+            Err(PsetSurjectionProofError::InputCountMismatch {
+                expected: 5,
+                actual: 4,
+                ..
+            })
+        ));
+
+        let mut removed = pset.clone();
+        removed.remove_input(0).unwrap();
+        assert!(matches!(
+            removed.verify_all_surjection_proofs_use_all_inputs(&secp, &[0, 1, 2, 3]),
+            Err(PsetSurjectionProofError::InputCountMismatch {
+                expected: 3,
+                actual: 4,
+                ..
+            })
+        ));
+
+        let mut inserted = pset.clone();
+        inserted.insert_input(pset.inputs()[0].clone(), 1);
+        assert!(matches!(
+            inserted.verify_all_surjection_proofs_use_all_inputs(&secp, &[0, 1, 2, 3]),
+            Err(PsetSurjectionProofError::InputCountMismatch {
+                expected: 5,
+                actual: 4,
+                ..
+            })
+        ));
+
+        let mut reordered = pset.clone();
+        reordered.inputs_mut().swap(0, 1);
+        assert_eq!(
+            reordered.verify_all_surjection_proofs_use_all_inputs(&secp, &[0, 1, 2, 3]),
+            Err(PsetSurjectionProofError::VerificationFailed(0))
+        );
+
+        let mut substituted = pset.clone();
+        substituted.inputs_mut()[0]
+            .witness_utxo
+            .as_mut()
+            .unwrap()
+            .asset = confidential::Asset::Explicit(crate::AssetId::from_byte_array([43; 32]));
+        assert_eq!(
+            substituted.verify_all_surjection_proofs_use_all_inputs(&secp, &[0, 1, 2, 3]),
+            Err(PsetSurjectionProofError::VerificationFailed(0))
+        );
+    }
+
+    #[test]
+    fn all_surjection_inputs_include_issuance_pseudo_inputs() {
+        use rand::{rngs::StdRng, SeedableRng};
+
+        let secp = secp256k1_zkp::Secp256k1::new();
+        let mut rng = StdRng::seed_from_u64(16);
+        let (mut pset, input_secrets) = pset_with_explicit_inputs(1, &[500]);
+        pset.inputs_mut()[0].issuance_value_amount = Some(1);
+        pset.inputs_mut()[0].blinded_issuance = Some(0);
+        pset.inputs_mut()[0].previous_output_index |= 1 << 31;
+
+        pset
+            .blind_last_with_all_surjection_inputs(&mut rng, &secp, &input_secrets, &[0])
+            .unwrap();
+        assert_surjection_proof_uses_all_inputs(
+            pset.outputs()[0].asset_surjection_proof.as_ref().unwrap(),
+            2,
+        );
+
+        let tx = pset.extract_tx().unwrap();
+        assert_eq!(pset.inputs()[0].issuance_ids(), tx.input[0].issuance_ids());
+        let spent_asset_generator = pset.inputs()[0]
+            .witness_utxo
+            .as_ref()
+            .unwrap()
+            .asset
+            .into_asset_gen(&secp)
+            .unwrap();
+        let (issuance_asset, _) = tx.input[0].issuance_ids();
+        let domain = [
+            spent_asset_generator,
+            Generator::new_unblinded(&secp, issuance_asset.into_tag()),
+        ];
+        let txout = &tx.output[0];
+        assert!(txout
+            .witness
+            .surjection_proof
+            .as_ref()
+            .unwrap()
+            .verify(&secp, txout.asset.commitment().unwrap(), &domain));
+
+        let mut issuance_mutated = pset.clone();
+        issuance_mutated.inputs_mut()[0].issuance_inflation_keys = Some(1);
+        assert!(matches!(
+            issuance_mutated.verify_all_surjection_proofs_use_all_inputs(&secp, &[0]),
+            Err(PsetSurjectionProofError::InputCountMismatch {
+                expected: 3,
+                actual: 2,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn pset_issuance_ids_mask_encoded_outpoint_flags() {
+        use crate::confidential::Value;
+
+        let asset_issuance = crate::AssetIssuance {
+            amount: Value::Explicit(1),
+            ..Default::default()
+        };
+        let txin = TxIn {
+            previous_output: OutPoint {
+                vout: 7,
+                ..Default::default()
+            },
+            is_pegin: true,
+            asset_issuance,
+            ..Default::default()
+        };
+
+        let pset_input = Input::from_txin(txin.clone());
+        assert_ne!(pset_input.previous_output_index & (1 << 30), 0);
+        assert_ne!(pset_input.previous_output_index & (1 << 31), 0);
+        assert_eq!(pset_input.issuance_ids(), txin.issuance_ids());
+    }
 
     #[track_caller]
     fn tx_pset_rtt(tx_hex: &str) {

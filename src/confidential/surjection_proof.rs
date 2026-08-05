@@ -47,6 +47,36 @@ impl SurjectionProof {
         .map(|inner| Self { inner: Some(Box::new(inner)) })
     }
 
+    /// Constructs a new [`SurjectionProof`] selecting exactly `inputs_to_use`
+    /// entries from `inputs` for the proof's ring.
+    ///
+    /// Passing the number of inputs selects every entry in the supplied domain.
+    /// The underlying library rejects zero, a count greater than the domain, and
+    /// domains or selected rings above its supported maximum.
+    pub fn new_with_input_count<R, C, S>(
+        secp: &Secp256k1<C>,
+        rng: &mut R,
+        asset: AssetId,
+        asset_bf: AssetBlindingFactor,
+        inputs: S,
+        inputs_to_use: usize,
+    ) -> Result<Self, secp256k1_zkp::Error>
+    where
+        R: RngCore + CryptoRng,
+        C: Signing,
+        S: AsRef<[(Generator, secp256k1_zkp::Tag, Tweak)]>,
+    {
+        secp256k1_zkp::SurjectionProof::new_with_input_count(
+            secp,
+            rng,
+            asset.into_tag(),
+            asset_bf.into_inner(),
+            inputs.as_ref(),
+            inputs_to_use,
+        )
+        .map(|inner| Self { inner: Some(Box::new(inner)) })
+    }
+
     /// Parses a [`SurjectionProof`] from a byte slice (with no length prefix).
     pub fn from_slice(sl: &[u8]) -> Result<Self, secp256k1_zkp::Error> {
         if sl.is_empty() {
@@ -63,6 +93,55 @@ impl SurjectionProof {
             Some(prf) => secp256k1_zkp::SurjectionProof::serialize(prf),
             None => Vec::new(),
         }
+    }
+
+    /// Returns the number of domain inputs encoded by this proof, or zero when
+    /// the proof is absent.
+    pub fn input_count(&self) -> usize {
+        let bytes = self.to_vec();
+        if bytes.len() < 2 {
+            0
+        } else {
+            u16::from_le_bytes([bytes[0], bytes[1]]) as usize
+        }
+    }
+
+    /// Returns the number of domain inputs selected in this proof's ring, or
+    /// zero when the proof is absent.
+    pub fn used_input_count(&self) -> usize {
+        let bytes = self.to_vec();
+        if bytes.len() < 2 {
+            return 0;
+        }
+        let input_count = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+        let bitmap_len = input_count.div_ceil(8);
+        if input_count == 0 || bytes.len() < 2 + bitmap_len {
+            0
+        } else {
+            (0..input_count)
+                .filter(|input_index| bytes[2 + input_index / 8] & (1 << (input_index % 8)) != 0)
+                .count()
+        }
+    }
+
+    /// Returns whether this non-empty proof selects every encoded domain input.
+    ///
+    /// Callers enforcing a final transaction domain must also compare
+    /// [`Self::input_count`] with that final domain's expected length.
+    pub fn uses_all_inputs(&self) -> bool {
+        let bytes = self.to_vec();
+        if bytes.len() < 3 {
+            return false;
+        }
+        let input_count = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+        let bitmap_len = input_count.div_ceil(8);
+        if input_count == 0 || bytes.len() < 2 + bitmap_len {
+            return false;
+        }
+        let bitmap = &bytes[2..2 + bitmap_len];
+        (0..input_count).all(|input_index| bitmap[input_index / 8] & (1 << (input_index % 8)) != 0)
+            && (input_count..bitmap_len * 8)
+                .all(|padding_index| bitmap[padding_index / 8] & (1 << (padding_index % 8)) == 0)
     }
 
     /// Outputs a [`SurjectionProof`] proving that an asset matches an exact asset ID.

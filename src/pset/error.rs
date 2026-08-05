@@ -264,3 +264,106 @@ impl fmt::Display for PsetBlindError {
     }
 }
 impl error::Error for PsetBlindError {}
+
+/// Ways an all-input PSET surjection-proof policy check might fail.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum PsetSurjectionProofError {
+    /// A required confidential-output index is outside the PSET output vector.
+    OutputIndexOutOfBounds(usize),
+    /// An input is missing the output it spends.
+    MissingWitnessUtxo(usize),
+    /// An input has a null asset and cannot contribute a proof generator.
+    NullInputAsset(usize),
+    /// An output intended to be confidential is missing its asset commitment.
+    MissingAssetCommitment(usize),
+    /// A confidential output is missing its surjection proof.
+    MissingSurjectionProof(usize),
+    /// A proof's encoded input count differs from the current PSET domain.
+    InputCountMismatch {
+        /// Output containing the proof.
+        output_index: usize,
+        /// Current PSET domain length.
+        expected: usize,
+        /// Domain length encoded by the proof.
+        actual: usize,
+    },
+    /// A proof does not select every real input in its encoded domain.
+    DoesNotUseAllInputs(usize),
+    /// A proof does not verify over the exact current ordered input domain.
+    VerificationFailed(usize),
+}
+
+impl fmt::Display for PsetSurjectionProofError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::OutputIndexOutOfBounds(i) => {
+                write!(f, "Required confidential output index {} is out of bounds", i)
+            }
+            Self::MissingWitnessUtxo(i) => {
+                write!(f, "Input index {} must have a witness UTXO", i)
+            }
+            Self::NullInputAsset(i) => {
+                write!(f, "Input index {} must have a non-null asset", i)
+            }
+            Self::MissingAssetCommitment(i) => {
+                write!(f, "Output index {} must have an asset commitment", i)
+            }
+            Self::MissingSurjectionProof(i) => {
+                write!(f, "Output index {} must have a surjection proof", i)
+            }
+            Self::InputCountMismatch {
+                output_index,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "Output index {} surjection proof commits to {} inputs, expected {}",
+                output_index, actual, expected
+            ),
+            Self::DoesNotUseAllInputs(i) => write!(
+                f,
+                "Output index {} surjection proof does not use every input",
+                i
+            ),
+            Self::VerificationFailed(i) => write!(
+                f,
+                "Output index {} surjection proof does not verify over the current input domain",
+                i
+            ),
+        }
+    }
+}
+
+impl error::Error for PsetSurjectionProofError {}
+
+/// Ways all-input PSET blinding or its final policy check might fail.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum PsetAllSurjectionProofBlindError {
+    /// PSET blinding failed.
+    Blinding(PsetBlindError),
+    /// The exact-final-domain surjection-proof policy failed.
+    Policy(PsetSurjectionProofError),
+}
+
+impl fmt::Display for PsetAllSurjectionProofBlindError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Blinding(error) => write!(f, "PSET blinding error: {}", error),
+            Self::Policy(error) => write!(f, "Surjection proof policy error: {}", error),
+        }
+    }
+}
+
+impl error::Error for PsetAllSurjectionProofBlindError {}
+
+impl From<PsetBlindError> for PsetAllSurjectionProofBlindError {
+    fn from(error: PsetBlindError) -> Self {
+        Self::Blinding(error)
+    }
+}
+
+impl From<PsetSurjectionProofError> for PsetAllSurjectionProofBlindError {
+    fn from(error: PsetSurjectionProofError) -> Self {
+        Self::Policy(error)
+    }
+}

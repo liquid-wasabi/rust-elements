@@ -462,6 +462,12 @@ impl SurjectionInput {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum SurjectionProofInputMode {
+    Default,
+    All,
+}
+
 impl Asset {
     /// Blinds the asset such that there is a surjection proof between
     /// the input assets and the output blinded asset.
@@ -475,6 +481,28 @@ impl Asset {
         secp: &Secp256k1<C>,
         asset_bf: AssetBlindingFactor,
         spent_utxo_secrets: &[S],
+    ) -> Result<(Self, SurjectionProof), ConfidentialTxOutError>
+    where
+        R: RngCore + CryptoRng,
+        C: Signing,
+        S: Into<SurjectionInput> + Copy,
+    {
+        self.blind_with_surjection_input_mode(
+            rng,
+            secp,
+            asset_bf,
+            spent_utxo_secrets,
+            SurjectionProofInputMode::Default,
+        )
+    }
+
+    pub(crate) fn blind_with_surjection_input_mode<R, C, S>(
+        self,
+        rng: &mut R,
+        secp: &Secp256k1<C>,
+        asset_bf: AssetBlindingFactor,
+        spent_utxo_secrets: &[S],
+        input_mode: SurjectionProofInputMode,
     ) -> Result<(Self, SurjectionProof), ConfidentialTxOutError>
     where
         R: RngCore + CryptoRng,
@@ -497,7 +525,19 @@ impl Asset {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let surjection_proof = SurjectionProof::new(secp, rng, asset, asset_bf, inputs)?;
+        let surjection_proof = match input_mode {
+            SurjectionProofInputMode::Default => {
+                SurjectionProof::new(secp, rng, asset, asset_bf, &inputs)
+            }
+            SurjectionProofInputMode::All => SurjectionProof::new_with_input_count(
+                secp,
+                rng,
+                asset,
+                asset_bf,
+                &inputs,
+                inputs.len(),
+            ),
+        }?;
 
         Ok((out_asset, surjection_proof))
     }
@@ -597,6 +637,32 @@ impl TxOut {
         C: Signing,
         S: Into<SurjectionInput> + Copy,
     {
+        Self::new_not_last_confidential_with_surjection_input_mode(
+            rng,
+            secp,
+            value,
+            address,
+            asset,
+            spent_utxo_secrets,
+            SurjectionProofInputMode::Default,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_not_last_confidential_with_surjection_input_mode<R, C, S>(
+        rng: &mut R,
+        secp: &Secp256k1<C>,
+        value: u64,
+        address: &Address,
+        asset: AssetId,
+        spent_utxo_secrets: &[S],
+        input_mode: SurjectionProofInputMode,
+    ) -> Result<(Self, AssetBlindingFactor, ValueBlindingFactor, SecretKey), ConfidentialTxOutError>
+    where
+        R: RngCore + CryptoRng,
+        C: Signing,
+        S: Into<SurjectionInput> + Copy,
+    {
         let spk = address.script_pubkey();
         let blinder = address
             .blinding_pubkey
@@ -606,7 +672,7 @@ impl TxOut {
         let out_secrets = TxOutSecrets::new(asset, asset_bf, value, value_bf);
         let ephemeral_sk = SecretKey::new(rng);
 
-        let txout = Self::with_txout_secrets(
+        let txout = Self::with_txout_secrets_and_surjection_input_mode(
             rng,
             secp,
             spk,
@@ -614,6 +680,7 @@ impl TxOut {
             ephemeral_sk,
             out_secrets,
             spent_utxo_secrets,
+            input_mode,
         )?;
         Ok((txout, asset_bf, value_bf, ephemeral_sk))
     }
@@ -642,9 +709,42 @@ impl TxOut {
         C: Signing,
         S: Into<SurjectionInput> + Copy,
     {
+        Self::with_txout_secrets_and_surjection_input_mode(
+            rng,
+            secp,
+            spk,
+            receiver_blinding_pk,
+            ephemeral_sk,
+            out_secrets,
+            spent_utxo_secrets,
+            SurjectionProofInputMode::Default,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_txout_secrets_and_surjection_input_mode<R, C, S>(
+        rng: &mut R,
+        secp: &Secp256k1<C>,
+        spk: Script,
+        receiver_blinding_pk: secp256k1_zkp::PublicKey,
+        ephemeral_sk: SecretKey,
+        out_secrets: TxOutSecrets,
+        spent_utxo_secrets: &[S],
+        input_mode: SurjectionProofInputMode,
+    ) -> Result<Self, ConfidentialTxOutError>
+    where
+        R: RngCore + CryptoRng,
+        C: Signing,
+        S: Into<SurjectionInput> + Copy,
+    {
         let exp_asset = Asset::Explicit(out_secrets.asset);
-        let (out_asset, surjection_proof) =
-            exp_asset.blind(rng, secp, out_secrets.asset_bf, spent_utxo_secrets)?;
+        let (out_asset, surjection_proof) = exp_asset.blind_with_surjection_input_mode(
+            rng,
+            secp,
+            out_secrets.asset_bf,
+            spent_utxo_secrets,
+            input_mode,
+        )?;
 
         let msg = RangeProofMessage::new(
             out_secrets.asset,
@@ -694,7 +794,29 @@ impl TxOut {
         C: Signing,
         S: Into<SurjectionInput> + Copy,
     {
-        let (txout, abf, vbf, ephemeral_sk) = Self::new_not_last_confidential(
+        self.to_non_last_confidential_with_surjection_input_mode(
+            rng,
+            secp,
+            blinder,
+            spent_utxo_secrets,
+            SurjectionProofInputMode::Default,
+        )
+    }
+
+    pub(crate) fn to_non_last_confidential_with_surjection_input_mode<R, C, S>(
+        &self,
+        rng: &mut R,
+        secp: &Secp256k1<C>,
+        blinder: secp256k1_zkp::PublicKey,
+        spent_utxo_secrets: &[S],
+        input_mode: SurjectionProofInputMode,
+    ) -> Result<(TxOut, AssetBlindingFactor, ValueBlindingFactor, SecretKey), ConfidentialTxOutError>
+    where
+        R: RngCore + CryptoRng,
+        C: Signing,
+        S: Into<SurjectionInput> + Copy,
+    {
+        Self::new_not_last_confidential_with_surjection_input_mode(
             rng,
             secp,
             self.value
@@ -706,8 +828,8 @@ impl TxOut {
                 .explicit()
                 .ok_or(ConfidentialTxOutError::ExpectedExplicitAsset)?,
             spent_utxo_secrets,
-        )?;
-        Ok((txout, abf, vbf, ephemeral_sk))
+            input_mode,
+        )
     }
 
     // Internally used function for getting the generator from asset
