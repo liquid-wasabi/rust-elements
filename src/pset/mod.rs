@@ -1524,6 +1524,280 @@ mod tests {
     }
 
     #[test]
+    fn all_surjection_inputs_bind_exact_new_issuance_domain() {
+        use crate::confidential::Value;
+        use crate::{AssetBlindingNonce, AssetEntropy, AssetIssuance};
+        use rand::{rngs::StdRng, SeedableRng};
+        use secp256k1_zkp::PedersenCommitment;
+
+        let secp = secp256k1_zkp::Secp256k1::new();
+        let mut rng = StdRng::seed_from_u64(17);
+        let (mut pset, input_secrets) =
+            pset_with_distinct_confidential_inputs(2, &[500]);
+        let previous_output = pset.inputs()[0].previous_outpoint();
+        let witness_utxo = pset.inputs()[0].witness_utxo.clone();
+        let mut issuance_input = Input::from_txin(TxIn {
+            previous_output,
+            asset_issuance: AssetIssuance {
+                asset_blinding_nonce: AssetBlindingNonce::NEW_ISSUANCE,
+                asset_entropy: AssetEntropy::from_byte_array([17; 32]),
+                amount: Value::Explicit(1),
+                inflation_keys: Value::Explicit(1),
+            },
+            ..Default::default()
+        });
+        issuance_input.witness_utxo = witness_utxo;
+        issuance_input.blinded_issuance = Some(0);
+        pset.inputs_mut()[0] = issuance_input;
+
+        let (issued_asset, reissuance_token) = pset.inputs()[0].issuance_ids();
+        let issuance_script = pset.outputs()[0].script_pubkey.clone();
+        pset.add_output(Output::new_explicit(
+            issuance_script.clone(),
+            1,
+            issued_asset,
+            None,
+        ));
+        pset.add_output(Output::new_explicit(
+            issuance_script,
+            1,
+            reissuance_token,
+            None,
+        ));
+        let expected_domain = vec![
+            pset.inputs()[0]
+                .witness_utxo
+                .as_ref()
+                .unwrap()
+                .asset
+                .into_asset_gen(&secp)
+                .unwrap(),
+            Generator::new_unblinded(&secp, issued_asset.into_tag()),
+            Generator::new_unblinded(&secp, reissuance_token.into_tag()),
+            pset.inputs()[1]
+                .witness_utxo
+                .as_ref()
+                .unwrap()
+                .asset
+                .into_asset_gen(&secp)
+                .unwrap(),
+        ];
+        let constructed_domain = pset
+            .surjection_inputs(&input_secrets)
+            .unwrap()
+            .iter()
+            .map(|input| input.surjection_target(&secp).unwrap().0)
+            .collect::<Vec<_>>();
+        assert_eq!(constructed_domain, expected_domain);
+
+        pset
+            .blind_last_with_all_surjection_inputs(&mut rng, &secp, &input_secrets, &[0])
+            .unwrap();
+        pset
+            .verify_all_surjection_proofs_use_all_inputs(&secp, &[0])
+            .unwrap();
+
+        let proof = pset.outputs()[0].asset_surjection_proof.as_ref().unwrap();
+        let output_generator = pset.outputs()[0].asset_comm.unwrap();
+        assert_surjection_proof_uses_all_inputs(proof, 4);
+        assert!(proof
+            .as_ref()
+            .unwrap()
+            .verify(&secp, output_generator, &expected_domain));
+        let spent_utxos = pset
+            .inputs()
+            .iter()
+            .map(|input| input.witness_utxo.clone().unwrap())
+            .collect::<Vec<_>>();
+        let tx = pset.extract_tx().unwrap();
+        assert_eq!(tx.input[0].issuance_ids(), (issued_asset, reissuance_token));
+        tx
+            .verify_tx_amt_proofs(&secp, &spent_utxos)
+            .unwrap();
+
+        let mut swapped_domain = expected_domain.clone();
+        swapped_domain.swap(1, 2);
+        assert!(!proof
+            .as_ref()
+            .unwrap()
+            .verify(&secp, output_generator, &swapped_domain));
+
+        let mut entropy_mutated = pset.clone();
+        entropy_mutated.inputs_mut()[0].issuance_asset_entropy =
+            Some(AssetEntropy::from_byte_array([18; 32]));
+        assert_eq!(
+            entropy_mutated.verify_all_surjection_proofs_use_all_inputs(&secp, &[0]),
+            Err(PsetSurjectionProofError::VerificationFailed(0))
+        );
+
+        let mut representation_mutated = pset.clone();
+        let issued_asset_generator = Generator::new_unblinded(&secp, issued_asset.into_tag());
+        let issuance_input = &mut representation_mutated.inputs_mut()[0];
+        issuance_input.issuance_value_amount = None;
+        issuance_input.issuance_value_comm = Some(PedersenCommitment::new_unblinded(
+            &secp,
+            1,
+            issued_asset_generator,
+        ));
+        let (mutated_asset, mutated_token) = issuance_input.issuance_ids();
+        assert_eq!(mutated_asset, issued_asset);
+        assert_ne!(mutated_token, reissuance_token);
+        assert_eq!(
+            representation_mutated.verify_all_surjection_proofs_use_all_inputs(&secp, &[0]),
+            Err(PsetSurjectionProofError::VerificationFailed(0))
+        );
+    }
+
+    #[test]
+    fn all_surjection_inputs_bind_non_null_nonce_reissuance_domain() {
+        use crate::confidential::{Asset, Value};
+        use crate::{AssetBlindingNonce, AssetEntropy, AssetId, AssetIssuance};
+        use rand::{rngs::StdRng, SeedableRng};
+
+        let secp = secp256k1_zkp::Secp256k1::new();
+        let mut rng = StdRng::seed_from_u64(18);
+        let (mut pset, mut input_secrets) =
+            pset_with_distinct_confidential_inputs(2, &[500]);
+        let entropy = AssetEntropy::from_byte_array([19; 32]);
+        let token_blinding_factor = AssetBlindingFactor::from_byte_array([20; 32]).unwrap();
+        let blinding_nonce =
+            AssetBlindingNonce::from_blinding_factor(token_blinding_factor);
+        let reissued_asset = AssetId::from_entropy(entropy);
+        let reissuance_token = AssetId::reissuance_token_from_entropy(entropy, false);
+
+        let previous_output = pset.inputs()[0].previous_outpoint();
+        let mut witness_utxo = pset.inputs()[0].witness_utxo.clone().unwrap();
+        // A reissuance prevout must be the corresponding blinded token.
+        witness_utxo.asset = Asset::new_confidential(
+            &secp,
+            reissuance_token,
+            token_blinding_factor,
+        );
+        witness_utxo.value = Value::Explicit(1);
+        let mut reissuance_input = Input::from_txin(TxIn {
+            previous_output,
+            asset_issuance: AssetIssuance {
+                asset_blinding_nonce: blinding_nonce,
+                asset_entropy: entropy,
+                amount: Value::Explicit(1),
+                // Consensus permits token creation only on initial issuance.
+                inflation_keys: Value::Null,
+            },
+            ..Default::default()
+        });
+        reissuance_input.witness_utxo = Some(witness_utxo);
+        reissuance_input.blinded_issuance = Some(0);
+        pset.inputs_mut()[0] = reissuance_input;
+        input_secrets.insert(
+            0,
+            TxOutSecrets::new(
+                reissuance_token,
+                token_blinding_factor,
+                1,
+                ValueBlindingFactor::zero(),
+            ),
+        );
+        // The remaining 1,000-unit spent input funds this output and fee.
+        pset.outputs_mut()[1].amount = Some(500);
+        pset.outputs_mut()[0].blinder_index = Some(1);
+        let issuance_script = pset.outputs()[0].script_pubkey.clone();
+        pset.add_output(Output::new_explicit(
+            issuance_script.clone(),
+            1,
+            reissued_asset,
+            None,
+        ));
+        pset.add_output(Output::new_explicit(
+            issuance_script,
+            1,
+            reissuance_token,
+            None,
+        ));
+
+        let expected_token_generator = Generator::new_blinded(
+            &secp,
+            reissuance_token.into_tag(),
+            token_blinding_factor.into_inner(),
+        );
+        assert_eq!(
+            pset.inputs()[0]
+                .witness_utxo
+                .as_ref()
+                .unwrap()
+                .asset
+                .commitment(),
+            Some(expected_token_generator)
+        );
+        assert_eq!(
+            pset.inputs()[0].issuance_ids(),
+            (reissued_asset, reissuance_token)
+        );
+
+        let expected_domain = vec![
+            expected_token_generator,
+            Generator::new_unblinded(&secp, reissued_asset.into_tag()),
+            pset.inputs()[1]
+                .witness_utxo
+                .as_ref()
+                .unwrap()
+                .asset
+                .into_asset_gen(&secp)
+                .unwrap(),
+        ];
+        let constructed_domain = pset
+            .surjection_inputs(&input_secrets)
+            .unwrap()
+            .iter()
+            .map(|input| input.surjection_target(&secp).unwrap().0)
+            .collect::<Vec<_>>();
+        assert_eq!(constructed_domain, expected_domain);
+
+        pset
+            .blind_last_with_all_surjection_inputs(&mut rng, &secp, &input_secrets, &[0])
+            .unwrap();
+        pset
+            .verify_all_surjection_proofs_use_all_inputs(&secp, &[0])
+            .unwrap();
+
+        let proof = pset.outputs()[0].asset_surjection_proof.as_ref().unwrap();
+        let output_generator = pset.outputs()[0].asset_comm.unwrap();
+        assert_surjection_proof_uses_all_inputs(proof, 3);
+        assert!(proof
+            .as_ref()
+            .unwrap()
+            .verify(&secp, output_generator, &expected_domain));
+        let spent_utxos = pset
+            .inputs()
+            .iter()
+            .map(|input| input.witness_utxo.clone().unwrap())
+            .collect::<Vec<_>>();
+        let tx = pset.extract_tx().unwrap();
+        assert_eq!(tx.input[0].issuance_ids(), (reissued_asset, reissuance_token));
+        assert_eq!(
+            tx.input[0].asset_issuance.asset_blinding_nonce,
+            blinding_nonce
+        );
+        tx
+            .verify_tx_amt_proofs(&secp, &spent_utxos)
+            .unwrap();
+
+        let mut swapped_domain = expected_domain.clone();
+        swapped_domain.swap(0, 1);
+        assert!(!proof
+            .as_ref()
+            .unwrap()
+            .verify(&secp, output_generator, &swapped_domain));
+
+        let mut entropy_mutated = pset.clone();
+        entropy_mutated.inputs_mut()[0].issuance_asset_entropy =
+            Some(AssetEntropy::from_byte_array([21; 32]));
+        assert_eq!(
+            entropy_mutated.verify_all_surjection_proofs_use_all_inputs(&secp, &[0]),
+            Err(PsetSurjectionProofError::VerificationFailed(0))
+        );
+    }
+
+    #[test]
     fn pset_issuance_ids_mask_encoded_outpoint_flags() {
         use crate::confidential::Value;
 
