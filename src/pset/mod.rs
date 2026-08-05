@@ -1179,6 +1179,214 @@ mod tests {
     }
 
     #[test]
+    fn all_surjection_inputs_bind_rangeproof_signatures() {
+        use crate::script::Builder;
+        use crate::sighash::{SighashCache, SighashRangeproofMode};
+        use crate::{EcdsaSighashType, Script, Witness};
+        use rand::{rngs::StdRng, SeedableRng};
+        use secp256k1_zkp::{Message, PublicKey, SecretKey};
+
+        let secp = secp256k1_zkp::Secp256k1::new();
+        let segwit_secret_key = SecretKey::from_slice(&[1; 32]).unwrap();
+        let legacy_secret_key = SecretKey::from_slice(&[2; 32]).unwrap();
+        let segwit_public_key = PublicKey::from_secret_key(&secp, &segwit_secret_key);
+        let legacy_public_key = PublicKey::from_secret_key(&secp, &legacy_secret_key);
+        let segwit_bitcoin_key = bitcoin::PublicKey::new(segwit_public_key);
+        let legacy_bitcoin_key = bitcoin::PublicKey::new(legacy_public_key);
+        let segwit_script_code = Script::new_p2pkh(&segwit_bitcoin_key.pubkey_hash());
+        let legacy_script_code = Script::new_p2pkh(&legacy_bitcoin_key.pubkey_hash());
+        let input_value = confidential::Value::Explicit(1_000);
+        let sighash_type = EcdsaSighashType::AllPlusRangeproof;
+
+        let mut rng = StdRng::seed_from_u64(19);
+        let (mut pset, input_secrets) = pset_with_explicit_inputs(3, &[1_200, 1_500]);
+        let segwit_script_pubkey =
+            Script::new_v0_wpkh(&segwit_bitcoin_key.wpubkey_hash().unwrap());
+        pset.inputs_mut()[0]
+            .witness_utxo
+            .as_mut()
+            .unwrap()
+            .script_pubkey = segwit_script_pubkey;
+        pset.inputs_mut()[1]
+            .witness_utxo
+            .as_mut()
+            .unwrap()
+            .script_pubkey = legacy_script_code.clone();
+
+        pset
+            .blind_last_with_all_surjection_inputs(
+                &mut rng,
+                &secp,
+                &input_secrets,
+                &[0, 1],
+            )
+            .unwrap();
+        pset
+            .verify_all_surjection_proofs_use_all_inputs(&secp, &[0, 1])
+            .unwrap();
+        for output in &pset.outputs()[..2] {
+            assert_surjection_proof_uses_all_inputs(
+                output.asset_surjection_proof.as_ref().unwrap(),
+                3,
+            );
+            assert!(!output.value_rangeproof.as_ref().unwrap().is_empty());
+        }
+
+        let protected_hashes = |tx: &Transaction| {
+            (
+                SighashCache::new(tx).segwitv0_sighash_with_rangeproof_mode(
+                    0,
+                    &segwit_script_code,
+                    input_value,
+                    sighash_type,
+                    SighashRangeproofMode::Enabled,
+                ),
+                SighashCache::new(tx).legacy_sighash_with_rangeproof_mode(
+                    1,
+                    &legacy_script_code,
+                    sighash_type,
+                    SighashRangeproofMode::Enabled,
+                ),
+            )
+        };
+        let unprotected_hashes = |tx: &Transaction| {
+            (
+                SighashCache::new(tx).segwitv0_sighash(
+                    0,
+                    &segwit_script_code,
+                    input_value,
+                    EcdsaSighashType::All,
+                ),
+                SighashCache::new(tx).segwitv0_sighash_with_rangeproof_mode(
+                    0,
+                    &segwit_script_code,
+                    input_value,
+                    sighash_type,
+                    SighashRangeproofMode::Disabled,
+                ),
+                SighashCache::new(tx).legacy_sighash(
+                    1,
+                    &legacy_script_code,
+                    EcdsaSighashType::All,
+                ),
+                SighashCache::new(tx).legacy_sighash_with_rangeproof_mode(
+                    1,
+                    &legacy_script_code,
+                    sighash_type,
+                    SighashRangeproofMode::Disabled,
+                ),
+            )
+        };
+
+        let unsigned_tx = pset.extract_tx().unwrap();
+        let spent_utxos = pset
+            .inputs()
+            .iter()
+            .map(|input| input.witness_utxo.clone().unwrap())
+            .collect::<Vec<_>>();
+        unsigned_tx
+            .verify_tx_amt_proofs(&secp, &spent_utxos)
+            .unwrap();
+        let (segwit_sighash, legacy_sighash) = protected_hashes(&unsigned_tx);
+        let segwit_message = Message::from_digest(segwit_sighash.to_byte_array());
+        let legacy_message = Message::from_digest(legacy_sighash.to_byte_array());
+        let segwit_signature = secp.sign_ecdsa(&segwit_message, &segwit_secret_key);
+        let legacy_signature = secp.sign_ecdsa(&legacy_message, &legacy_secret_key);
+        secp.verify_ecdsa(&segwit_message, &segwit_signature, &segwit_public_key)
+            .unwrap();
+        secp.verify_ecdsa(&legacy_message, &legacy_signature, &legacy_public_key)
+            .unwrap();
+
+        let mut segwit_signature_bytes = segwit_signature.serialize_der().to_vec();
+        segwit_signature_bytes.push(sighash_type.as_u32() as u8);
+        let mut legacy_signature_bytes = legacy_signature.serialize_der().to_vec();
+        legacy_signature_bytes.push(sighash_type.as_u32() as u8);
+        pset.inputs_mut()[0].sighash_type = Some(PsbtSighashType::from(sighash_type));
+        pset.inputs_mut()[0].final_script_witness = Some(Witness::from_slice(&[
+            segwit_signature_bytes,
+            segwit_bitcoin_key.to_bytes(),
+        ]));
+        pset.inputs_mut()[1].sighash_type = Some(PsbtSighashType::from(sighash_type));
+        pset.inputs_mut()[1].final_script_sig = Some(
+            Builder::new()
+                .push_slice(&legacy_signature_bytes)
+                .push_key(&legacy_bitcoin_key)
+                .into_script(),
+        );
+
+        let signed_tx = pset.extract_tx().unwrap();
+        assert_eq!(protected_hashes(&signed_tx), (segwit_sighash, legacy_sighash));
+        assert_eq!(signed_tx.input[0].witness.script_witness.len(), 2);
+        assert!(!signed_tx.input[1].script_sig.is_empty());
+
+        let unprotected = unprotected_hashes(&signed_tx);
+        let mut rangeproof_mutation = signed_tx.clone();
+        rangeproof_mutation.output[0].witness.rangeproof = RangeProof::EMPTY;
+        assert_ne!(
+            rangeproof_mutation.output[0].witness.rangeproof,
+            signed_tx.output[0].witness.rangeproof,
+        );
+        assert_eq!(
+            rangeproof_mutation.output[0].witness.surjection_proof,
+            signed_tx.output[0].witness.surjection_proof,
+        );
+        assert_eq!(
+            (&rangeproof_mutation.output[0].asset,
+             &rangeproof_mutation.output[0].value,
+             &rangeproof_mutation.output[0].nonce,
+             &rangeproof_mutation.output[0].script_pubkey),
+            (&signed_tx.output[0].asset,
+             &signed_tx.output[0].value,
+             &signed_tx.output[0].nonce,
+             &signed_tx.output[0].script_pubkey),
+        );
+        assert_eq!(&rangeproof_mutation.output[1..], &signed_tx.output[1..]);
+
+        let mut surjection_mutation = signed_tx.clone();
+        surjection_mutation.output[0].witness.surjection_proof = SurjectionProof::EMPTY;
+        assert_ne!(
+            surjection_mutation.output[0].witness.surjection_proof,
+            signed_tx.output[0].witness.surjection_proof,
+        );
+        assert_eq!(
+            surjection_mutation.output[0].witness.rangeproof,
+            signed_tx.output[0].witness.rangeproof,
+        );
+        assert_eq!(
+            (&surjection_mutation.output[0].asset,
+             &surjection_mutation.output[0].value,
+             &surjection_mutation.output[0].nonce,
+             &surjection_mutation.output[0].script_pubkey),
+            (&signed_tx.output[0].asset,
+             &signed_tx.output[0].value,
+             &signed_tx.output[0].nonce,
+             &signed_tx.output[0].script_pubkey),
+        );
+        assert_eq!(&surjection_mutation.output[1..], &signed_tx.output[1..]);
+
+        for mutated_tx in [&rangeproof_mutation, &surjection_mutation] {
+            let (mutated_segwit, mutated_legacy) = protected_hashes(mutated_tx);
+            assert_ne!(mutated_segwit, segwit_sighash);
+            assert_ne!(mutated_legacy, legacy_sighash);
+            assert!(secp
+                .verify_ecdsa(
+                    &Message::from_digest(mutated_segwit.to_byte_array()),
+                    &segwit_signature,
+                    &segwit_public_key,
+                )
+                .is_err());
+            assert!(secp
+                .verify_ecdsa(
+                    &Message::from_digest(mutated_legacy.to_byte_array()),
+                    &legacy_signature,
+                    &legacy_public_key,
+                )
+                .is_err());
+            assert_eq!(unprotected_hashes(mutated_tx), unprotected);
+        }
+    }
+
+    #[test]
     fn default_pset_blinding_keeps_three_input_surjection_ring() {
         use rand::{rngs::StdRng, SeedableRng};
 
