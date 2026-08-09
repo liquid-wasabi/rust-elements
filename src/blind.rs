@@ -1777,6 +1777,63 @@ mod tests {
         tx.verify_tx_amt_proofs(&secp, core::slice::from_ref(&spent_utxo))
             .unwrap();
 
+        let spent_secrets = TxOutSecrets::new(
+            asset,
+            AssetBlindingFactor::zero(),
+            1_000,
+            ValueBlindingFactor::zero(),
+        );
+        let mut rng = thread_rng();
+        let receiver_key = SecretKey::new(&mut rng);
+        let receiver_public_key = secp256k1_zkp::PublicKey::from_secret_key(&secp, &receiver_key);
+        let (mut confidential_asset_zero, _, _, _) = TxOut::new_last_confidential(
+            &mut rng,
+            &secp,
+            1_000,
+            asset,
+            Script::from(vec![0x6a]),
+            receiver_public_key,
+            &[spent_secrets],
+            &[],
+        )
+        .unwrap();
+        confidential_asset_zero.value = Value::Explicit(0);
+        tx.output[2] = confidential_asset_zero.clone();
+        tx.verify_tx_amt_proofs(&secp, core::slice::from_ref(&spent_utxo))
+            .unwrap();
+
+        tx.output[2].witness.surjection_proof = SurjectionProof::EMPTY;
+        assert_eq!(
+            tx.verify_tx_amt_proofs(&secp, core::slice::from_ref(&spent_utxo)),
+            Err(VerificationError::SurjectionProofMissing(2)),
+        );
+
+        let other_asset = AssetId::from_byte_array([0x42; 32]);
+        let other_spent_secrets = TxOutSecrets::new(
+            other_asset,
+            AssetBlindingFactor::zero(),
+            1_000,
+            ValueBlindingFactor::zero(),
+        );
+        let (mut invalid_domain_zero, _, _, _) = TxOut::new_last_confidential(
+            &mut rng,
+            &secp,
+            1_000,
+            other_asset,
+            Script::from(vec![0x6a]),
+            receiver_public_key,
+            &[other_spent_secrets],
+            &[],
+        )
+        .unwrap();
+        invalid_domain_zero.value = Value::Explicit(0);
+        tx.output[2] = invalid_domain_zero;
+        assert_eq!(
+            tx.verify_tx_amt_proofs(&secp, core::slice::from_ref(&spent_utxo)),
+            Err(VerificationError::SurjectionProofVerificationError(2)),
+        );
+
+        tx.output[2] = confidential_asset_zero;
         tx.output[2].asset = Asset::Null;
         assert_eq!(
             tx.verify_tx_amt_proofs(&secp, core::slice::from_ref(&spent_utxo)),
