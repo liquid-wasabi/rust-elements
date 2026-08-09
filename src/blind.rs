@@ -1261,11 +1261,20 @@ impl Transaction {
         }
 
         for (i, out) in self.output.iter().enumerate() {
-            // Compute the value commitments and asset generator
-            let out_commit = out
-                .get_value_commit(secp)
-                .map_err(|e| VerificationError::SpentTxOutError(i, e))?;
-            out_commits.push(out_commit);
+            // Explicit zero-valued outputs are valid only when provably
+            // unspendable, and contribute nothing to the balance equation.
+            // Still validate their asset and any applicable proofs below.
+            if matches!(out.value, Value::Explicit(0))
+                && out.script_pubkey.is_provably_unspendable()
+            {
+                out.get_asset_gen(secp)
+                    .map_err(|e| VerificationError::TxOutError(i, e))?;
+            } else {
+                let out_commit = out
+                    .get_value_commit(secp)
+                    .map_err(|e| VerificationError::TxOutError(i, e))?;
+                out_commits.push(out_commit);
+            }
 
             // rangeproof checks
             if let Some(comm) = out.value.commitment() {
@@ -1729,5 +1738,62 @@ mod tests {
             .unwrap();
         }
         tx.verify_tx_amt_proofs(&secp, &utxos).unwrap();
+    }
+
+    #[test]
+    fn verify_amount_proofs_accepts_only_unspendable_explicit_zero_outputs() {
+        let secp = secp256k1_zkp::Secp256k1::new();
+        let asset = AssetId::LIQUIDTESTNET_BTC;
+        let spent_utxo = TxOut {
+            asset: Asset::Explicit(asset),
+            value: Value::Explicit(1_000),
+            nonce: Nonce::Null,
+            script_pubkey: Script::from(vec![0x51]),
+            witness: TxOutWitness::default(),
+        };
+        let mut tx = Transaction {
+            version: 2,
+            lock_time: crate::LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: vec![
+                TxOut {
+                    asset: Asset::Explicit(asset),
+                    value: Value::Explicit(900),
+                    nonce: Nonce::Null,
+                    script_pubkey: Script::from(vec![0x51]),
+                    witness: TxOutWitness::default(),
+                },
+                TxOut::new_fee(100, asset),
+                TxOut {
+                    asset: Asset::Explicit(asset),
+                    value: Value::Explicit(0),
+                    nonce: Nonce::Null,
+                    script_pubkey: Script::from(vec![0x6a]),
+                    witness: TxOutWitness::default(),
+                },
+            ],
+        };
+
+        tx.verify_tx_amt_proofs(&secp, core::slice::from_ref(&spent_utxo))
+            .unwrap();
+
+        tx.output[2].asset = Asset::Null;
+        assert_eq!(
+            tx.verify_tx_amt_proofs(&secp, core::slice::from_ref(&spent_utxo)),
+            Err(VerificationError::TxOutError(
+                2,
+                TxOutError::UnExpectedNullAsset,
+            )),
+        );
+
+        tx.output[2].asset = Asset::Explicit(asset);
+        tx.output[2].script_pubkey = Script::from(vec![0x51]);
+        assert_eq!(
+            tx.verify_tx_amt_proofs(&secp, &[spent_utxo]),
+            Err(VerificationError::TxOutError(
+                2,
+                TxOutError::NonUnspendableZeroValue,
+            )),
+        );
     }
 }
