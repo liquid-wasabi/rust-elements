@@ -972,13 +972,26 @@ impl TxOut {
         secp: &Secp256k1<C>,
         blinding_key: SecretKey,
     ) -> Result<TxOutSecrets, UnblindError> {
-        let (Value::Confidential(commitment), Asset::Confidential(additional_generator)) = (self.value, self.asset) else {
+        self.unblind_with_key(secp, &blinding_key)
+    }
+
+    /// Unblinds a transaction output while borrowing the blinding key.
+    ///
+    /// It returns the secret elements of the value and asset Pedersen commitments.
+    pub fn unblind_with_key<C: Signing + Verification>(
+        &self,
+        secp: &Secp256k1<C>,
+        blinding_key: &SecretKey,
+    ) -> Result<TxOutSecrets, UnblindError> {
+        let (Value::Confidential(commitment), Asset::Confidential(additional_generator)) =
+            (self.value, self.asset)
+        else {
             return Err(UnblindError::NotConfidential);
         };
 
         let shared_secret = self
             .nonce
-            .shared_secret(&blinding_key)
+            .shared_secret(blinding_key)
             .ok_or(UnblindError::MissingNonce)?;
         let rangeproof = self
             .witness
@@ -986,13 +999,14 @@ impl TxOut {
             .as_ref()
             .ok_or(UnblindError::MissingRangeproof)?;
 
-        let (opening, _) = rangeproof.rewind(
+        let (opening, _) = rangeproof.rewind_inclusive(
             secp,
             commitment,
-            shared_secret,
+            &shared_secret,
             self.script_pubkey.as_bytes(),
             additional_generator,
-        ).map_err(UnblindError::Rewind)?;
+        )
+        .map_err(UnblindError::Rewind)?;
 
         let value = opening.value;
         let value_bf = ValueBlindingFactor(opening.blinding_factor);
@@ -1617,8 +1631,12 @@ mod tests {
         )
         .unwrap();
 
+        let borrowed_txout_secrets = txout
+            .unblind_with_key(SECP256K1, &blinding_sk)
+            .unwrap();
         let txout_secrets = txout.unblind(SECP256K1, blinding_sk).unwrap();
 
+        assert_eq!(borrowed_txout_secrets, txout_secrets);
         assert_eq!(txout_secrets.asset, asset);
         assert_eq!(txout_secrets.value, value);
     }

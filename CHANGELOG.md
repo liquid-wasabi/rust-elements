@@ -1,3 +1,9 @@
+# Unreleased
+
+* Add a `TxOut` output-opening method that borrows its blinding key while
+  retaining the existing by-value method.
+* Pin the range-proof dependency revision that supports inclusive value ranges.
+
 # 0.27.0 - 2026-07-28
 
 This release updates several dependencies. It attempts to minimize API breakage beyond updating
