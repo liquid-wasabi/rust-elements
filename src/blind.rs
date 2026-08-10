@@ -39,7 +39,7 @@ pub enum TxOutError {
     UnExpectedNullValue,
     /// Unexpected Null asset
     UnExpectedNullAsset,
-    /// Zero value explicit txout with non-provably unspendable script
+    /// Explicit zero or confidential range permitting zero with a spendable script
     NonUnspendableZeroValue,
     /// Zero value pedersen commitment with provably unspendable script
     ZeroValueCommitment,
@@ -55,10 +55,8 @@ impl fmt::Display for TxOutError {
             TxOutError::UnExpectedNullValue => write!(f, "UnExpected Null Value"),
             TxOutError::UnExpectedNullAsset => write!(f, "UnExpected Null Asset"),
             TxOutError::NonUnspendableZeroValue => {
-                write!(
-                    f,
-                    "Zero value explicit amounts must be provably unspendable.\
-                    See IsUnspendable in elements"
+                f.write_str(
+                    "Explicit zero amounts and confidential ranges permitting zero require a provably unspendable script",
                 )
             }
             TxOutError::ZeroValueCommitment => {
@@ -1286,9 +1284,15 @@ impl Transaction {
                     .rangeproof
                     .as_ref()
                     .ok_or(VerificationError::RangeProofMissing(i))?;
-                rangeproof
-                    .verify(secp, comm, out.script_pubkey.as_bytes(), gen)
+                let public_range = rangeproof
+                    .verify_inclusive(secp, comm, out.script_pubkey.as_bytes(), gen)
                     .map_err(|e| VerificationError::RangeProofError(i, e))?;
+                if *public_range.start() == 0 && !out.script_pubkey.is_provably_unspendable() {
+                    return Err(VerificationError::TxOutError(
+                        i,
+                        TxOutError::NonUnspendableZeroValue,
+                    ));
+                }
             } else {
                 // No rangeproof checks for explicit values
             }
@@ -1739,6 +1743,232 @@ mod tests {
             .unwrap();
         }
         tx.verify_tx_amt_proofs(&secp, &utxos).unwrap();
+    }
+
+    fn confidential_value_output(
+        secp: &Secp256k1<secp256k1_zkp::All>,
+        asset: AssetId,
+        value: u64,
+        value_blinding_factor: ValueBlindingFactor,
+        script_pubkey: Script,
+        range_minimum: u64,
+        minimum_private_bits: u8,
+    ) -> TxOut {
+        let asset_generator = Generator::new_unblinded(secp, asset.into_tag());
+        let confidential_value =
+            Value::new_confidential(secp, value, asset_generator, value_blinding_factor);
+        let value_commitment = confidential_value
+            .commitment()
+            .expect("the test value is confidential");
+        let rangeproof = RangeProof::new(
+            secp,
+            range_minimum,
+            value_commitment,
+            value,
+            value_blinding_factor.into_inner(),
+            &[],
+            script_pubkey.as_bytes(),
+            SecretKey::new(&mut thread_rng()),
+            0,
+            minimum_private_bits,
+            asset_generator,
+        )
+        .expect("the test range proof parameters are valid");
+
+        TxOut {
+            asset: Asset::Explicit(asset),
+            value: confidential_value,
+            nonce: Nonce::Null,
+            script_pubkey,
+            witness: TxOutWitness {
+                surjection_proof: SurjectionProof::EMPTY,
+                rangeproof,
+            },
+        }
+    }
+
+    fn verified_public_range(
+        secp: &Secp256k1<secp256k1_zkp::All>,
+        output: &TxOut,
+    ) -> core::ops::RangeInclusive<u64> {
+        output
+            .witness
+            .rangeproof
+            .as_ref()
+            .expect("the test output has a range proof")
+            .verify_inclusive(
+                secp,
+                output
+                    .value
+                    .commitment()
+                    .expect("the test output value is confidential"),
+                output.script_pubkey.as_bytes(),
+                output
+                    .asset
+                    .into_asset_gen(secp)
+                    .expect("the test output asset is explicit"),
+            )
+            .expect("the test range proof verifies")
+    }
+
+    fn explicit_spent_output(asset: AssetId, value: u64) -> TxOut {
+        TxOut {
+            asset: Asset::Explicit(asset),
+            value: Value::Explicit(value),
+            nonce: Nonce::Null,
+            script_pubkey: Script::from(vec![0x51]),
+            witness: TxOutWitness::default(),
+        }
+    }
+
+    fn transaction_with_outputs(outputs: Vec<TxOut>) -> Transaction {
+        Transaction {
+            version: 2,
+            lock_time: crate::LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: outputs,
+        }
+    }
+
+    #[test]
+    fn verify_amount_proofs_rejects_spendable_confidential_zero_start_range() {
+        let secp = secp256k1_zkp::Secp256k1::new();
+        let asset = AssetId::LIQUIDTESTNET_BTC;
+        let output = confidential_value_output(
+            &secp,
+            asset,
+            900,
+            ValueBlindingFactor::zero(),
+            Script::from(vec![0x51]),
+            0,
+            52,
+        );
+        let public_range = verified_public_range(&secp, &output);
+        assert_eq!(*public_range.start(), 0);
+        assert!(public_range.contains(&900));
+        let tx = transaction_with_outputs(vec![output, TxOut::new_fee(100, asset)]);
+        let spent_utxo = explicit_spent_output(asset, 1_000);
+
+        let error = tx
+            .verify_tx_amt_proofs(&secp, core::slice::from_ref(&spent_utxo))
+            .unwrap_err();
+        assert_eq!(
+            error,
+            VerificationError::TxOutError(0, TxOutError::NonUnspendableZeroValue),
+        );
+        assert_eq!(
+            error.to_string(),
+            "Output index 0 txout: Explicit zero amounts and confidential ranges permitting zero require a provably unspendable script",
+        );
+    }
+
+    #[test]
+    fn verify_amount_proofs_rejects_spendable_confidential_actual_zero() {
+        let secp = secp256k1_zkp::Secp256k1::new();
+        let asset = AssetId::LIQUIDTESTNET_BTC;
+        let zero_blinding_factor = ValueBlindingFactor::new(&mut thread_rng());
+        let zero_output = confidential_value_output(
+            &secp,
+            asset,
+            0,
+            zero_blinding_factor,
+            Script::from(vec![0x51]),
+            0,
+            3,
+        );
+        let public_range = verified_public_range(&secp, &zero_output);
+        assert_eq!(*public_range.start(), 0);
+        assert!(public_range.contains(&0));
+        let balancing_output = confidential_value_output(
+            &secp,
+            asset,
+            900,
+            -zero_blinding_factor,
+            Script::from(vec![0x51]),
+            1,
+            52,
+        );
+        let tx = transaction_with_outputs(vec![
+            zero_output,
+            balancing_output,
+            TxOut::new_fee(100, asset),
+        ]);
+        let spent_utxo = explicit_spent_output(asset, 1_000);
+
+        assert_eq!(
+            tx.verify_tx_amt_proofs(&secp, core::slice::from_ref(&spent_utxo)),
+            Err(VerificationError::TxOutError(
+                0,
+                TxOutError::NonUnspendableZeroValue,
+            )),
+        );
+    }
+
+    #[test]
+    fn verify_amount_proofs_accepts_unspendable_confidential_zero_start_range() {
+        let secp = secp256k1_zkp::Secp256k1::new();
+        let asset = AssetId::LIQUIDTESTNET_BTC;
+        let output = confidential_value_output(
+            &secp,
+            asset,
+            900,
+            ValueBlindingFactor::zero(),
+            Script::from(vec![0x6a]),
+            0,
+            52,
+        );
+        let public_range = verified_public_range(&secp, &output);
+        assert_eq!(*public_range.start(), 0);
+        assert!(public_range.contains(&900));
+        let tx = transaction_with_outputs(vec![output, TxOut::new_fee(100, asset)]);
+        let spent_utxo = explicit_spent_output(asset, 1_000);
+
+        tx.verify_tx_amt_proofs(&secp, core::slice::from_ref(&spent_utxo))
+            .unwrap();
+    }
+
+    #[test]
+    fn verify_amount_proofs_accepts_unspendable_full_inclusive_range() {
+        let secp = secp256k1_zkp::Secp256k1::new();
+        let asset = AssetId::LIQUIDTESTNET_BTC;
+        let output = confidential_value_output(
+            &secp,
+            asset,
+            900,
+            ValueBlindingFactor::zero(),
+            Script::from(vec![0x6a]),
+            0,
+            64,
+        );
+        assert_eq!(verified_public_range(&secp, &output), 0..=u64::MAX);
+        let tx = transaction_with_outputs(vec![output, TxOut::new_fee(100, asset)]);
+        let spent_utxo = explicit_spent_output(asset, 1_000);
+
+        tx.verify_tx_amt_proofs(&secp, core::slice::from_ref(&spent_utxo))
+            .unwrap();
+    }
+
+    #[test]
+    fn verify_amount_proofs_accepts_spendable_confidential_positive_start_range() {
+        let secp = secp256k1_zkp::Secp256k1::new();
+        let asset = AssetId::LIQUIDTESTNET_BTC;
+        let output = confidential_value_output(
+            &secp,
+            asset,
+            900,
+            ValueBlindingFactor::zero(),
+            Script::from(vec![0x51]),
+            1,
+            52,
+        );
+        let public_range = verified_public_range(&secp, &output);
+        assert_eq!(*public_range.start(), 1);
+        assert!(public_range.contains(&900));
+        let tx = transaction_with_outputs(vec![output, TxOut::new_fee(100, asset)]);
+        let spent_utxo = explicit_spent_output(asset, 1_000);
+
+        tx.verify_tx_amt_proofs(&secp, core::slice::from_ref(&spent_utxo))
+            .unwrap();
     }
 
     #[test]
