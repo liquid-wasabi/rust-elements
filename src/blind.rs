@@ -1513,7 +1513,6 @@ mod tests {
     use crate::Script;
     use bitcoin::{PrivateKey, PublicKey};
     use rand::thread_rng;
-    use secp256k1_zkp::SECP256K1;
     use std::str::FromStr;
 
     #[test]
@@ -1586,11 +1585,12 @@ mod tests {
     #[test]
     fn unblind_txout() {
         let value = 10;
+        let secp = secp256k1_zkp::Secp256k1::new();
 
         let (address, blinding_sk) = {
             let sk = SecretKey::new(&mut thread_rng());
             let pk = PublicKey::from_private_key(
-                SECP256K1,
+                &secp,
                 &PrivateKey {
                     compressed: true,
                     network: bitcoin::NetworkKind::Test,
@@ -1599,7 +1599,7 @@ mod tests {
             );
             let blinding_sk = SecretKey::new(&mut thread_rng());
             let blinding_pk = PublicKey::from_private_key(
-                SECP256K1,
+                &secp,
                 &PrivateKey {
                     compressed: true,
                     network: bitcoin::NetworkKind::Test,
@@ -1632,7 +1632,7 @@ mod tests {
 
         let (txout, _, _, _) = TxOut::new_not_last_confidential(
             &mut thread_rng(),
-            SECP256K1,
+            &secp,
             value,
             &address,
             asset,
@@ -1641,9 +1641,9 @@ mod tests {
         .unwrap();
 
         let borrowed_txout_secrets = txout
-            .unblind_with_key(SECP256K1, &blinding_sk)
+            .unblind_with_key(&secp, &blinding_sk)
             .unwrap();
-        let txout_secrets = txout.unblind(SECP256K1, blinding_sk).unwrap();
+        let txout_secrets = txout.unblind(&secp, blinding_sk).unwrap();
 
         assert_eq!(borrowed_txout_secrets, txout_secrets);
         assert_eq!(txout_secrets.asset, asset);
@@ -1652,19 +1652,20 @@ mod tests {
 
     #[test]
     fn blind_value_proof_test() {
+        let secp = secp256k1_zkp::Secp256k1::new();
         let id = AssetId::from_byte_array([1u8; 32]);
         let abf = AssetBlindingFactor::new(&mut thread_rng());
-        let asset = confidential::Asset::new_confidential(SECP256K1, id, abf);
+        let asset = confidential::Asset::new_confidential(&secp, id, abf);
 
         let asset_gen = asset.commitment().unwrap();
         // Create a value commitment
         let explicit_val = 10;
         let vbf = ValueBlindingFactor::new(&mut thread_rng());
-        let v = confidential::Value::new_confidential(SECP256K1, explicit_val, asset_gen, vbf);
+        let v = confidential::Value::new_confidential(&secp, explicit_val, asset_gen, vbf);
         let value_comm = v.commitment().unwrap();
         let proof = RangeProof::blind_value_proof(
             &mut thread_rng(),
-            SECP256K1,
+            &secp,
             explicit_val,
             value_comm,
             asset_gen,
@@ -1672,22 +1673,22 @@ mod tests {
         )
         .unwrap();
 
-        let res = proof.blind_value_proof_verify(SECP256K1, explicit_val, asset_gen, value_comm);
+        let res = proof.blind_value_proof_verify(&secp, explicit_val, asset_gen, value_comm);
         assert!(res);
     }
 
     #[test]
     fn blind_asset_proof_test() {
+        let secp = secp256k1_zkp::Secp256k1::new();
         let id = AssetId::from_byte_array([1u8; 32]);
         let abf = AssetBlindingFactor::new(&mut thread_rng());
-        let asset = confidential::Asset::new_confidential(SECP256K1, id, abf);
+        let asset = confidential::Asset::new_confidential(&secp, id, abf);
 
         let asset_comm = asset.commitment().unwrap();
         // Create the proof
-        let proof =
-            SurjectionProof::blind_asset_proof(&mut thread_rng(), SECP256K1, id, abf).unwrap();
+        let proof = SurjectionProof::blind_asset_proof(&mut thread_rng(), &secp, id, abf).unwrap();
 
-        let res = proof.blind_asset_proof_verify(SECP256K1, id, asset_comm);
+        let res = proof.blind_asset_proof_verify(&secp, id, asset_comm);
         assert!(res);
     }
 
