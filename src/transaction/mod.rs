@@ -1621,6 +1621,24 @@ mod tests {
         assert!(!tx.input[0].is_coinbase());
         assert!(tx.input[0].is_pegin());
         assert_eq!(tx.input[0].witness.pegin_witness.len(), 6);
+        let reconstructed_previous_output = tx.input[0]
+            .pegin_data()
+            .expect("the fixture has a parsed peg-in witness")
+            .to_claimed_previous_output();
+        assert_eq!(reconstructed_previous_output.asset, tx.output[0].asset);
+        assert_eq!(
+            reconstructed_previous_output.value,
+            confidential::Value::Explicit(100_000_000),
+        );
+        assert_eq!(
+            reconstructed_previous_output.script_pubkey.as_bytes(),
+            &[
+                0x00, 0x14, 0x1a, 0xb7, 0xf5, 0x99, 0x5c, 0xf0, 0xdf, 0xcb, 0x90, 0xcb,
+                0xb0, 0x2b, 0x63, 0x39, 0x7e, 0x53, 0x26, 0xea, 0xe6, 0xfe,
+            ],
+        );
+        assert!(reconstructed_previous_output.nonce.is_null());
+        assert!(reconstructed_previous_output.witness.is_empty());
         assert_eq!(
             tx.input[0].pegin_data(),
             Some(&super::PeginData {

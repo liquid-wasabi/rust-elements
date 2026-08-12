@@ -13,7 +13,8 @@ use bitcoin::block::{
 use bitcoin::hashes::Hash as _;
 use hashes::encoding::UnexpectedEofError;
 
-use crate::{encode, encoding, AssetId};
+use crate::confidential::{Asset, Nonce, Value};
+use crate::{encode, encoding, AssetId, Script, TxOut, TxOutWitness};
 
 const TOTAL_PEGIN_LENGTH: usize = 6;
 
@@ -211,6 +212,28 @@ pub struct PeginData {
 }
 
 impl PeginData {
+    /// Reconstructs the Elements previous output claimed by this peg-in
+    /// witness.
+    ///
+    /// This is the Rust equivalent of Elements' `GetPeginOutputFromWitness`:
+    /// the asset, value, and claim script become one explicit output. It does
+    /// This structural conversion performs no peg-in acceptance validation.
+    /// Before treating the output as an accepted transaction input, callers
+    /// must complete the full `IsValidPeginWitness`-equivalent validation for
+    /// their bound network profile. That includes, but is not limited to,
+    /// amount range, pegged-asset identity, claim-script size, parent
+    /// transaction, inclusion proof and header rules, federation script,
+    /// parent genesis, confirmation depth, and sidechain placement.
+    pub fn to_claimed_previous_output(&self) -> TxOut {
+        TxOut {
+            asset: Asset::Explicit(self.asset_id),
+            value: Value::Explicit(self.value),
+            nonce: Nonce::Null,
+            script_pubkey: Script::from(self.claim_script.as_bytes().to_vec()),
+            witness: TxOutWitness::default(),
+        }
+    }
+
     /// Parse the mainchain tx provided as pegin data.
     pub fn parse_tx(&self) -> Result<bitcoin::Transaction, bitcoin::consensus::encode::Error> {
         bitcoin::consensus::encode::deserialize(&self.transaction)
