@@ -32,6 +32,8 @@ use crate::{
     Address, AssetId, Transaction, TxOut, TxOutWitness,
 };
 
+const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
+
 /// Transaction Output related errors
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TxOutError {
@@ -93,6 +95,8 @@ pub enum VerificationError {
     TxOutError(usize, TxOutError),
     /// Issuance transaction verification not supported yet
     IssuanceTransactionInput(usize),
+    /// Issuance validation failed at one input or pseudo-input location.
+    Issuance(CtLocation, IssuanceVerificationError),
     /// Spent input len must match the len of transaction input
     UtxoInputLenMismatch,
     /// Balance Check failed
@@ -117,6 +121,9 @@ impl fmt::Display for VerificationError {
             }
             VerificationError::IssuanceTransactionInput(i) => {
                 write!(f, "Issuance transaction input {} not supported yet", i)
+            }
+            VerificationError::Issuance(location, error) => {
+                write!(f, "Issuance validation failed at {:?}: {}", location, error)
             }
             VerificationError::UtxoInputLenMismatch => {
                 write!(f, "Utxo len must match the len of transaction inputs")
@@ -144,6 +151,63 @@ impl fmt::Display for VerificationError {
 }
 
 impl std::error::Error for VerificationError {}
+
+/// Issuance-specific failures from amount-proof validation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IssuanceVerificationError {
+    /// The transaction omits the witness container required for issuance data.
+    MissingWitnessContainer,
+    /// An explicit issuance amount is zero.
+    ExplicitZero,
+    /// An explicit issuance amount is outside Elements' signed amount domain.
+    ExplicitAmountOutOfRange,
+    /// An explicit issuance amount carries a range proof.
+    UnexpectedRangeProof,
+    /// A confidential issuance amount has no range proof.
+    MissingRangeProof,
+    /// A confidential issuance range proof did not validate.
+    InvalidRangeProof(secp256k1_zkp::Error),
+    /// An explicit pegged-asset issuance amount exceeds `MAX_MONEY`.
+    PeggedAssetAmountOutOfRange,
+    /// The public reissuance blinding nonce is outside the scalar field.
+    InvalidReissuanceBlindingNonce,
+    /// The spent asset generator is not the derived blinded token generator.
+    ReissuanceTokenMismatch,
+    /// A reissuance attempts to create additional inflation keys.
+    ReissuanceInflationKeys,
+}
+
+impl fmt::Display for IssuanceVerificationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::MissingWitnessContainer => "issuance transaction has no witness container",
+            Self::ExplicitZero => "explicit issuance amount is zero",
+            Self::ExplicitAmountOutOfRange => {
+                "explicit issuance amount is outside the signed amount domain"
+            }
+            Self::UnexpectedRangeProof => "explicit issuance amount has a range proof",
+            Self::MissingRangeProof => "confidential issuance amount has no range proof",
+            Self::InvalidRangeProof(_) => "confidential issuance range proof is invalid",
+            Self::PeggedAssetAmountOutOfRange => {
+                "explicit pegged-asset issuance amount is out of range"
+            }
+            Self::InvalidReissuanceBlindingNonce => "reissuance blinding nonce is invalid",
+            Self::ReissuanceTokenMismatch => {
+                "spent asset generator does not match the reissuance token"
+            }
+            Self::ReissuanceInflationKeys => "reissuance creates inflation keys",
+        })
+    }
+}
+
+impl std::error::Error for IssuanceVerificationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidRangeProof(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// Errors encountered when constructing confidential transaction outputs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1163,6 +1227,79 @@ pub struct CtLocation {
     pub ty: CtLocationType,
 }
 
+fn issuance_error(
+    input_index: usize,
+    ty: CtLocationType,
+    error: IssuanceVerificationError,
+) -> VerificationError {
+    VerificationError::Issuance(CtLocation { input_index, ty }, error)
+}
+
+fn verify_issuance_amount(
+    secp: &Secp256k1<secp256k1_zkp::All>,
+    input_index: usize,
+    ty: CtLocationType,
+    value: Value,
+    asset: AssetId,
+    rangeproof: &RangeProof,
+    pegged_asset: AssetId,
+) -> Result<Option<(Generator, PedersenCommitment)>, VerificationError> {
+    let generator = Generator::new_unblinded(secp, asset.into_tag());
+    match value {
+        Value::Null => Ok(None),
+        Value::Explicit(0) => Err(issuance_error(
+            input_index,
+            ty,
+            IssuanceVerificationError::ExplicitZero,
+        )),
+        Value::Explicit(value) => {
+            if value > i64::MAX as u64 {
+                return Err(issuance_error(
+                    input_index,
+                    ty,
+                    IssuanceVerificationError::ExplicitAmountOutOfRange,
+                ));
+            }
+            if asset == pegged_asset && value > MAX_MONEY {
+                return Err(issuance_error(
+                    input_index,
+                    ty,
+                    IssuanceVerificationError::PeggedAssetAmountOutOfRange,
+                ));
+            }
+            if !rangeproof.is_empty() {
+                return Err(issuance_error(
+                    input_index,
+                    ty,
+                    IssuanceVerificationError::UnexpectedRangeProof,
+                ));
+            }
+            Ok(Some((
+                generator,
+                PedersenCommitment::new_unblinded(secp, value, generator),
+            )))
+        }
+        Value::Confidential(commitment) => {
+            let proof = rangeproof.as_ref().ok_or_else(|| {
+                issuance_error(
+                    input_index,
+                    ty,
+                    IssuanceVerificationError::MissingRangeProof,
+                )
+            })?;
+            proof
+                .verify_inclusive(secp, commitment, &[], generator)
+                .map_err(|error| {
+                    issuance_error(
+                        input_index,
+                        ty,
+                        IssuanceVerificationError::InvalidRangeProof(error),
+                    )
+                })?;
+            Ok(Some((generator, commitment)))
+        }
+    }
+}
 
 impl Transaction {
     /// Verify that the transaction has correctly calculated blinding
@@ -1216,10 +1353,58 @@ impl Transaction {
         secp: &Secp256k1<secp256k1_zkp::All>,
         spent_utxos: &[TxOut],
     ) -> Result<(), VerificationError> {
+        if let Some((input_index, _)) = self
+            .input
+            .iter()
+            .enumerate()
+            .find(|(_, input)| input.has_issuance())
+        {
+            return Err(VerificationError::IssuanceTransactionInput(input_index));
+        }
+        self.verify_tx_amt_proofs_inner(secp, spent_utxos, None)
+    }
+
+    /// Verifies amount proofs while applying the Elements issuance and
+    /// reissuance predicates for the supplied consensus pegged asset.
+    ///
+    /// The pegged asset must come from the authenticated network profile. This
+    /// method validates issuance range proofs, pseudo-input ordering, and the
+    /// reissuance token generator linkage in addition to the ordinary checks
+    /// performed by [`Transaction::verify_tx_amt_proofs`]. It still does not
+    /// validate scripts, signatures, chain inclusion, current unspentness,
+    /// peg-in witnesses, or the remaining transaction consensus rules.
+    pub fn verify_tx_amt_proofs_with_issuance(
+        &self,
+        secp: &Secp256k1<secp256k1_zkp::All>,
+        spent_utxos: &[TxOut],
+        pegged_asset: AssetId,
+    ) -> Result<(), VerificationError> {
+        self.verify_tx_amt_proofs_inner(secp, spent_utxos, Some(pegged_asset))
+    }
+
+    fn verify_tx_amt_proofs_inner(
+        &self,
+        secp: &Secp256k1<secp256k1_zkp::All>,
+        spent_utxos: &[TxOut],
+        pegged_asset: Option<AssetId>,
+    ) -> Result<(), VerificationError> {
         if spent_utxos.len() != self.input.len() {
             return Err(VerificationError::UtxoInputLenMismatch);
         }
-        // Issuances and reissuances not supported yet
+        if !self.has_witness() {
+            if let Some((input_index, _)) = self
+                .input
+                .iter()
+                .enumerate()
+                .find(|(_, input)| input.has_issuance())
+            {
+                return Err(issuance_error(
+                    input_index,
+                    CtLocationType::Input,
+                    IssuanceVerificationError::MissingWitnessContainer,
+                ));
+            }
+        }
         let mut in_commits = vec![];
         let mut out_commits = vec![];
         let mut domain = vec![];
@@ -1234,25 +1419,66 @@ impl Transaction {
                     .map_err(|e| VerificationError::SpentTxOutError(i, e))?,
             );
             if inp.has_issuance() {
+                let pegged_asset = pegged_asset
+                    .expect("issuance inputs were rejected before ordinary amount validation");
                 let (asset_id, token_id) = inp.issuance_ids();
+                if !inp.asset_issuance.asset_blinding_nonce.is_null() {
+                    let token_blinding_factor = AssetBlindingFactor::from_byte_array(
+                        inp.asset_issuance.asset_blinding_nonce.to_byte_array(),
+                    )
+                    .map_err(|_| {
+                        issuance_error(
+                            i,
+                            CtLocationType::Input,
+                            IssuanceVerificationError::InvalidReissuanceBlindingNonce,
+                        )
+                    })?;
+                    let expected_token_generator = Generator::new_blinded(
+                        secp,
+                        token_id.into_tag(),
+                        token_blinding_factor.into_inner(),
+                    );
+                    if spent_utxos[i].asset.commitment() != Some(expected_token_generator) {
+                        return Err(issuance_error(
+                            i,
+                            CtLocationType::Input,
+                            IssuanceVerificationError::ReissuanceTokenMismatch,
+                        ));
+                    }
+                    if !inp.asset_issuance.inflation_keys.is_null() {
+                        return Err(issuance_error(
+                            i,
+                            CtLocationType::Reissuance,
+                            IssuanceVerificationError::ReissuanceInflationKeys,
+                        ));
+                    }
+                }
                 let arr = [
-                    (inp.asset_issuance.amount, asset_id),
-                    (inp.asset_issuance.inflation_keys, token_id),
+                    (
+                        CtLocationType::Issuance,
+                        inp.asset_issuance.amount,
+                        asset_id,
+                        &inp.witness.amount_rangeproof,
+                    ),
+                    (
+                        CtLocationType::Reissuance,
+                        inp.asset_issuance.inflation_keys,
+                        token_id,
+                        &inp.witness.inflation_keys_rangeproof,
+                    ),
                 ];
-                for (amt, asset) in &arr {
-                    match amt {
-                        Value::Null => {},
-                        Value::Explicit(v) => {
-                            let gen = Generator::new_unblinded(secp, asset.into_tag());
-                            domain.push(gen);
-                            let comm = PedersenCommitment::new_unblinded(secp, *v, gen);
-                            in_commits.push(comm);
-                        }
-                        Value::Confidential(comm) => {
-                            let gen = Generator::new_unblinded(secp, asset.into_tag());
-                            domain.push(gen);
-                            in_commits.push(*comm);
-                        }
+                for (ty, value, asset, rangeproof) in arr {
+                    if let Some((generator, commitment)) = verify_issuance_amount(
+                        secp,
+                        i,
+                        ty,
+                        value,
+                        asset,
+                        rangeproof,
+                        pegged_asset,
+                    )? {
+                        domain.push(generator);
+                        in_commits.push(commitment);
                     }
                 }
             }
@@ -1742,7 +1968,178 @@ mod tests {
             )
             .unwrap();
         }
-        tx.verify_tx_amt_proofs(&secp, &utxos).unwrap();
+        assert_eq!(
+            tx.verify_tx_amt_proofs(&secp, &utxos),
+            Err(VerificationError::IssuanceTransactionInput(0))
+        );
+        tx.verify_tx_amt_proofs_with_issuance(&secp, &utxos, AssetId::LIQUID_BTC)
+            .unwrap();
+    }
+
+    #[test]
+    fn issuance_amount_rejection_predicates() {
+        let secp = secp256k1_zkp::Secp256k1::new();
+        let asset = AssetId::from_byte_array([3; 32]);
+        let empty_proof = RangeProof::EMPTY;
+
+        assert_eq!(
+            verify_issuance_amount(
+                &secp,
+                0,
+                CtLocationType::Issuance,
+                Value::Explicit(0),
+                asset,
+                &empty_proof,
+                AssetId::LIQUID_BTC,
+            )
+            .unwrap_err(),
+            issuance_error(
+                0,
+                CtLocationType::Issuance,
+                IssuanceVerificationError::ExplicitZero,
+            )
+        );
+        assert_eq!(
+            verify_issuance_amount(
+                &secp,
+                0,
+                CtLocationType::Issuance,
+                Value::Explicit(i64::MAX as u64 + 1),
+                asset,
+                &empty_proof,
+                AssetId::LIQUID_BTC,
+            )
+            .unwrap_err(),
+            issuance_error(
+                0,
+                CtLocationType::Issuance,
+                IssuanceVerificationError::ExplicitAmountOutOfRange,
+            )
+        );
+        assert_eq!(
+            verify_issuance_amount(
+                &secp,
+                0,
+                CtLocationType::Issuance,
+                Value::Explicit(MAX_MONEY + 1),
+                AssetId::LIQUID_BTC,
+                &empty_proof,
+                AssetId::LIQUID_BTC,
+            )
+            .unwrap_err(),
+            issuance_error(
+                0,
+                CtLocationType::Issuance,
+                IssuanceVerificationError::PeggedAssetAmountOutOfRange,
+            )
+        );
+
+        let fixture: Transaction = encode::deserialize(
+            &hex::decode_to_vec(include_str!("../tests/data/issue_tx.hex")).unwrap(),
+        )
+        .unwrap();
+        let proof = fixture
+            .input
+            .iter()
+            .flat_map(|input| {
+                [
+                    &input.witness.amount_rangeproof,
+                    &input.witness.inflation_keys_rangeproof,
+                ]
+            })
+            .find(|proof| !proof.is_empty())
+            .unwrap();
+        assert_eq!(
+            verify_issuance_amount(
+                &secp,
+                0,
+                CtLocationType::Issuance,
+                Value::Explicit(1),
+                asset,
+                proof,
+                AssetId::LIQUID_BTC,
+            )
+            .unwrap_err(),
+            issuance_error(
+                0,
+                CtLocationType::Issuance,
+                IssuanceVerificationError::UnexpectedRangeProof,
+            )
+        );
+
+        let generator = Generator::new_unblinded(&secp, asset.into_tag());
+        let commitment = PedersenCommitment::new_unblinded(&secp, 1, generator);
+        assert_eq!(
+            verify_issuance_amount(
+                &secp,
+                0,
+                CtLocationType::Issuance,
+                Value::Confidential(commitment),
+                asset,
+                &empty_proof,
+                AssetId::LIQUID_BTC,
+            )
+            .unwrap_err(),
+            issuance_error(
+                0,
+                CtLocationType::Issuance,
+                IssuanceVerificationError::MissingRangeProof,
+            )
+        );
+        assert!(matches!(
+            verify_issuance_amount(
+                &secp,
+                0,
+                CtLocationType::Issuance,
+                Value::Confidential(commitment),
+                asset,
+                proof,
+                AssetId::LIQUID_BTC,
+            ),
+            Err(VerificationError::Issuance(
+                CtLocation {
+                    input_index: 0,
+                    ty: CtLocationType::Issuance,
+                },
+                IssuanceVerificationError::InvalidRangeProof(_),
+            ))
+        ));
+    }
+
+    #[test]
+    fn issuance_requires_witness_container() {
+        let secp = secp256k1_zkp::Secp256k1::new();
+        let asset = AssetId::from_byte_array([4; 32]);
+        let tx = Transaction {
+            version: 2,
+            lock_time: crate::LockTime::ZERO,
+            input: vec![TxIn {
+                asset_issuance: crate::AssetIssuance {
+                    amount: Value::Explicit(1),
+                    ..crate::AssetIssuance::null()
+                },
+                ..TxIn::default()
+            }],
+            output: vec![],
+        };
+        let spent_utxo = TxOut {
+            asset: Asset::Explicit(asset),
+            value: Value::Explicit(1),
+            ..TxOut::default()
+        };
+
+        assert_eq!(
+            tx.verify_tx_amt_proofs_with_issuance(
+                &secp,
+                &[spent_utxo],
+                AssetId::LIQUID_BTC,
+            ),
+            Err(issuance_error(
+                0,
+                CtLocationType::Input,
+                IssuanceVerificationError::MissingWitnessContainer,
+            ))
+        );
     }
 
     fn confidential_value_output(

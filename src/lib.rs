@@ -81,8 +81,8 @@ use internals::array_vec::ArrayVec;
 
 pub use crate::address::{Address, AddressError, AddressParams};
 pub use crate::blind::{
-    BlindError, ConfidentialTxOutError, CtLocation, CtLocationType, RangeProofMessage,
-    SurjectionInput, TxOutError, TxOutSecrets, UnblindError, VerificationError,
+    BlindError, ConfidentialTxOutError, CtLocation, CtLocationType, IssuanceVerificationError,
+    RangeProofMessage, SurjectionInput, TxOutError, TxOutSecrets, UnblindError, VerificationError,
 };
 pub use crate::block::{Block, BlockHeader, DynafedRoot, ExtData as BlockExtData};
 pub use crate::confidential::{RangeProof, SurjectionProof};

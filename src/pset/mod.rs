@@ -1819,8 +1819,16 @@ mod tests {
             .collect::<Vec<_>>();
         let tx = pset.extract_tx().unwrap();
         assert_eq!(tx.input[0].issuance_ids(), (issued_asset, reissuance_token));
+        assert_eq!(
+            tx.verify_tx_amt_proofs(&secp, &spent_utxos),
+            Err(crate::blind::VerificationError::IssuanceTransactionInput(0))
+        );
         tx
-            .verify_tx_amt_proofs(&secp, &spent_utxos)
+            .verify_tx_amt_proofs_with_issuance(
+                &secp,
+                &spent_utxos,
+                crate::AssetId::LIQUID_BTC,
+            )
             .unwrap();
 
         let mut swapped_domain = expected_domain.clone();
@@ -1985,9 +1993,70 @@ mod tests {
             tx.input[0].asset_issuance.asset_blinding_nonce,
             blinding_nonce
         );
+        assert_eq!(
+            tx.verify_tx_amt_proofs(&secp, &spent_utxos),
+            Err(crate::blind::VerificationError::IssuanceTransactionInput(0))
+        );
         tx
-            .verify_tx_amt_proofs(&secp, &spent_utxos)
+            .verify_tx_amt_proofs_with_issuance(
+                &secp,
+                &spent_utxos,
+                crate::AssetId::LIQUID_BTC,
+            )
             .unwrap();
+
+        let mut invalid_nonce_tx = tx.clone();
+        invalid_nonce_tx.input[0].asset_issuance.asset_blinding_nonce =
+            AssetBlindingNonce::from_byte_array([0xff; 32]);
+        assert!(matches!(
+            invalid_nonce_tx.verify_tx_amt_proofs_with_issuance(
+                &secp,
+                &spent_utxos,
+                crate::AssetId::LIQUID_BTC,
+            ),
+            Err(crate::blind::VerificationError::Issuance(
+                CtLocation {
+                    input_index: 0,
+                    ty: CtLocationType::Input,
+                },
+                crate::blind::IssuanceVerificationError::InvalidReissuanceBlindingNonce,
+            ))
+        ));
+
+        let mut mismatched_utxos = spent_utxos.clone();
+        mismatched_utxos[0].asset =
+            Asset::Explicit(AssetId::from_byte_array([22; 32]));
+        assert_eq!(
+            tx.verify_tx_amt_proofs_with_issuance(
+                &secp,
+                &mismatched_utxos,
+                crate::AssetId::LIQUID_BTC,
+            ),
+            Err(crate::blind::VerificationError::Issuance(
+                CtLocation {
+                    input_index: 0,
+                    ty: CtLocationType::Input,
+                },
+                crate::blind::IssuanceVerificationError::ReissuanceTokenMismatch,
+            ))
+        );
+
+        let mut inflation_keys_tx = tx.clone();
+        inflation_keys_tx.input[0].asset_issuance.inflation_keys = Value::Explicit(1);
+        assert_eq!(
+            inflation_keys_tx.verify_tx_amt_proofs_with_issuance(
+                &secp,
+                &spent_utxos,
+                crate::AssetId::LIQUID_BTC,
+            ),
+            Err(crate::blind::VerificationError::Issuance(
+                CtLocation {
+                    input_index: 0,
+                    ty: CtLocationType::Reissuance,
+                },
+                crate::blind::IssuanceVerificationError::ReissuanceInflationKeys,
+            ))
+        );
 
         let mut swapped_domain = expected_domain.clone();
         swapped_domain.swap(0, 1);
